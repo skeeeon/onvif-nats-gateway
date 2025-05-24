@@ -2,11 +2,16 @@ package cli
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
-	"time"
+	"net"
+	"net/http"
 	"strings"
+	"time"
 
+	"github.com/IOTechSystems/onvif"
+	"github.com/IOTechSystems/onvif/device"
 	"onvif-nats-gateway/internal/config"
 	"onvif-nats-gateway/internal/constants"
 	"onvif-nats-gateway/internal/discovery"
@@ -146,6 +151,19 @@ func (c *CLI) registerCommands() {
 		Handler:     c.handleListDevices,
 		Flags: []Flag{
 			{Name: "devices", Description: "Device config file path", Default: constants.DefaultDeviceConfigPath},
+		},
+	})
+
+	// Test connection command
+	c.RegisterCommand(&Command{
+		Name:        "test-connection",
+		Description: "Test connectivity to a specific device",
+		Handler:     c.handleTestConnection,
+		Flags: []Flag{
+			{Name: "address", Description: "Device ONVIF service URL", Default: "", Required: true},
+			{Name: "username", Description: "Username for authentication", Default: "admin"},
+			{Name: "password", Description: "Password for authentication", Default: "", Required: true},
+			{Name: "verbose", Description: "Enable verbose output", Default: false},
 		},
 	})
 }
@@ -578,6 +596,7 @@ func (c *CLI) showUsage() {
 	fmt.Printf("  %s generate-config -username admin -password pass  # Generate device config\n", constants.AppName)
 	fmt.Printf("  %s list-devices                                # List all configured devices\n", constants.AppName)
 	fmt.Printf("  %s enable-device -name camera_01               # Enable a specific device\n", constants.AppName)
+	fmt.Printf("  %s test-connection -address http://IP:PORT/onvif/device_service -username admin -password pass  # Test device connectivity\n", constants.AppName)
 	fmt.Printf("  %s fix-config                                  # Fix device addresses in config\n", constants.AppName)
 	fmt.Printf("  %s validate                                    # Validate configuration\n", constants.AppName)
 	fmt.Printf("  %s -config app.yaml -devices devices.yaml     # Run with custom configs\n", constants.AppName)
@@ -749,6 +768,145 @@ func (c *CLI) handleListDevices(ctx *Context) error {
 	}
 
 	return nil
+}
+
+// handleTestConnection handles the test-connection command
+func (c *CLI) handleTestConnection(ctx *Context) error {
+	address := ctx.Flags["address"].(string)
+	username := ctx.Flags["username"].(string)
+	password := ctx.Flags["password"].(string)
+	verbose := ctx.Flags["verbose"].(bool)
+
+	if verbose {
+		// Set logger to debug level for verbose output
+		logger.Initialize(logger.Config{
+			Level:  "debug",
+			Format: "text",
+		})
+	}
+
+	fmt.Printf("Testing connectivity to ONVIF device...\n")
+	fmt.Printf("Address:  %s\n", address)
+	fmt.Printf("Username: %s\n", username)
+	fmt.Printf("Password: %s\n", "[hidden]")
+	fmt.Printf("\n")
+
+	// Test basic HTTP connectivity
+	fmt.Printf("1. Testing basic HTTP connectivity...\n")
+	if err := c.testBasicHTTP(address, username, password); err != nil {
+		fmt.Printf("❌ HTTP connectivity test failed: %v\n", err)
+		return err
+	}
+	fmt.Printf("✅ HTTP connectivity successful\n\n")
+
+	// Test ONVIF connection
+	fmt.Printf("2. Testing ONVIF device creation...\n")
+	if err := c.testONVIFConnection(address, username, password, verbose); err != nil {
+		fmt.Printf("❌ ONVIF connection test failed: %v\n", err)
+		return err
+	}
+	fmt.Printf("✅ ONVIF connection successful\n\n")
+
+	fmt.Printf("🎉 All connectivity tests passed!\n")
+	fmt.Printf("This device should work with the ONVIF-NATS Gateway.\n")
+
+	return nil
+}
+
+// testBasicHTTP tests basic HTTP connectivity
+func (c *CLI) testBasicHTTP(address, username, password string) error {
+	httpClient := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			Dial: (&net.Dialer{
+				Timeout: 5 * time.Second,
+			}).Dial,
+			TLSHandshakeTimeout:   5 * time.Second,
+			ResponseHeaderTimeout: 5 * time.Second,
+			TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+
+	req, err := http.NewRequest("GET", address, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create HTTP request: %w", err)
+	}
+
+	if username != "" && password != "" {
+		req.SetBasicAuth(username, password)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("HTTP request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	fmt.Printf("   Status Code: %d\n", resp.StatusCode)
+	fmt.Printf("   Content-Type: %s\n", resp.Header.Get("Content-Type"))
+	fmt.Printf("   Server: %s\n", resp.Header.Get("Server"))
+
+	return nil
+}
+
+// testONVIFConnection tests ONVIF device creation and basic functionality
+func (c *CLI) testONVIFConnection(address, username, password string, verbose bool) error {
+	// Create custom HTTP client
+	httpClient := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			Dial: (&net.Dialer{
+				Timeout: 10 * time.Second,
+			}).Dial,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 15 * time.Second,
+			TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+
+	// Try different authentication methods
+	authMethods := []string{"digest", "ws-security", ""}
+	
+	for _, authMode := range authMethods {
+		authName := authMode
+		if authName == "" {
+			authName = "default"
+		}
+		fmt.Printf("   Trying %s authentication...\n", authName)
+
+		deviceParams := onvif.DeviceParams{
+			Xaddr:      address,
+			Username:   username,
+			Password:   password,
+			HttpClient: httpClient,
+			AuthMode:   authMode,
+		}
+
+		onvifDevice, err := onvif.NewDevice(deviceParams)
+		if err != nil {
+			if verbose {
+				fmt.Printf("   ⚠️  %s auth failed: %v\n", authName, err)
+			}
+			continue
+		}
+
+		// Test GetDeviceInformation
+		fmt.Printf("   ✅ Device created with %s auth\n", authName)
+		
+		getDeviceInfoReq := device.GetDeviceInformation{}
+		response, err := onvifDevice.CallMethod(getDeviceInfoReq)
+		if err != nil {
+			fmt.Printf("   ⚠️  GetDeviceInformation failed: %v\n", err)
+			continue
+		}
+
+		fmt.Printf("   ✅ GetDeviceInformation successful\n")
+		fmt.Printf("   Response Status: %d\n", response.StatusCode)
+		
+		return nil
+	}
+
+	return fmt.Errorf("all authentication methods failed")
 }
 
 // Version information (can be set via build flags)
