@@ -42,9 +42,10 @@ func main() {
 	cliHandler := cli.NewCLI()
 	cliHandler.Initialize()
 
-	// Check if this is a CLI command
+	// Check if this is a CLI command (not the main application)
 	if len(os.Args) > 1 {
-		err := cliHandler.Execute(os.Args[1:])
+		// Try to execute as CLI command first
+		handled, err := cliHandler.Execute(os.Args[1:])
 		if err != nil {
 			if appErr, ok := err.(*errors.AppError); ok {
 				fmt.Fprintf(os.Stderr, "Error: %s\n", appErr.Message)
@@ -57,15 +58,9 @@ func main() {
 			os.Exit(1)
 		}
 		
-		// If CLI command was executed, exit
-		if len(os.Args) > 1 {
-			for cmdName := range map[string]bool{
-				"discover": true, "generate-config": true, "version": true, "validate": true, "help": true,
-			} {
-				if os.Args[1] == cmdName || os.Args[1] == "-"+cmdName || os.Args[1] == "--"+cmdName {
-					return
-				}
-			}
+		// If a CLI command was handled, exit successfully
+		if handled {
+			return
 		}
 	}
 

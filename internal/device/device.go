@@ -147,24 +147,79 @@ func (m *Manager) discoverDevices() error {
 
 	for _, discoveredDevice := range discoveredDevices {
 		deviceParams := discoveredDevice.GetDeviceParams()
-		m.logger.WithField("address", deviceParams.Xaddr).Debug("Found ONVIF device")
+		discoveredAddr := deviceParams.Xaddr
+		normalizedAddr := m.normalizeDiscoveredAddress(discoveredAddr)
 		
-		// Check if device is already configured
+		m.logger.WithField("address", discoveredAddr).Debug("Found ONVIF device")
+		
+		// Check if device is already configured (compare normalized addresses)
 		found := false
 		for _, configDevice := range m.deviceConfig.Devices {
-			if configDevice.Address == deviceParams.Xaddr {
+			if m.addressesMatch(configDevice.Address, normalizedAddr) {
+				if configDevice.Enabled {
+					m.logger.WithFields(map[string]interface{}{
+						"device_name":   configDevice.Name,
+						"address":       configDevice.Address,
+						"discovered_as": discoveredAddr,
+					}).Info("ONVIF device is configured and enabled")
+				} else {
+					m.logger.WithFields(map[string]interface{}{
+						"device_name":   configDevice.Name,
+						"address":       configDevice.Address,
+						"discovered_as": discoveredAddr,
+					}).Info("ONVIF device is configured but disabled")
+				}
 				found = true
 				break
 			}
 		}
 
 		if !found {
-			m.logger.WithField("address", deviceParams.Xaddr).
+			m.logger.WithField("address", discoveredAddr).
 				Info("New ONVIF device discovered but not configured")
 		}
 	}
 
 	return nil
+}
+
+// normalizeDiscoveredAddress converts a discovered address to a full ONVIF URL
+func (m *Manager) normalizeDiscoveredAddress(address string) string {
+	// If already a complete URL, return as-is
+	if strings.HasPrefix(address, "http://") || strings.HasPrefix(address, "https://") {
+		return address
+	}
+	
+	// Add http:// prefix and common ONVIF service path
+	return fmt.Sprintf("http://%s/onvif/device_service", address)
+}
+
+// addressesMatch checks if two addresses refer to the same ONVIF device
+func (m *Manager) addressesMatch(configAddr, discoveredAddr string) bool {
+	// Direct match
+	if configAddr == discoveredAddr {
+		return true
+	}
+	
+	// Extract host:port from both addresses for comparison
+	configHost := m.extractHostPort(configAddr)
+	discoveredHost := m.extractHostPort(discoveredAddr)
+	
+	return configHost == discoveredHost
+}
+
+// extractHostPort extracts the host:port portion from a URL
+func (m *Manager) extractHostPort(address string) string {
+	// Remove protocol if present
+	addr := strings.TrimPrefix(address, "http://")
+	addr = strings.TrimPrefix(addr, "https://")
+	
+	// Split on first slash to get host:port
+	parts := strings.Split(addr, "/")
+	if len(parts) > 0 {
+		return parts[0]
+	}
+	return addr
 }
 
 // addDevice adds and connects to an ONVIF device

@@ -262,7 +262,7 @@ func ValidateDevice(device *Device, index int) error {
 	}
 
 	if !strings.HasPrefix(device.Address, "http://") && !strings.HasPrefix(device.Address, "https://") {
-		return fmt.Errorf("device[%d]: address must be a valid HTTP/HTTPS URL", index)
+		return fmt.Errorf("device[%d]: address must be a valid HTTP/HTTPS URL (e.g., http://192.168.1.100:80/onvif/device_service), got: %s", index, device.Address)
 	}
 
 	if device.NATSTopic == "" {
@@ -306,6 +306,22 @@ func (dc *DeviceConfig) GetEnabledDevices() []Device {
 	return enabled
 }
 
+// GetAllDevices returns all devices (enabled and disabled)
+func (dc *DeviceConfig) GetAllDevices() []Device {
+	return dc.Devices
+}
+
+// CountEnabledDevices returns the count of enabled devices
+func (dc *DeviceConfig) CountEnabledDevices() int {
+	count := 0
+	for _, device := range dc.Devices {
+		if device.Enabled {
+			count++
+		}
+	}
+	return count
+}
+
 // AddDevice adds a new device to the configuration
 func (dc *DeviceConfig) AddDevice(device Device) error {
 	if err := ValidateDevice(&device, len(dc.Devices)); err != nil {
@@ -326,6 +342,28 @@ func (dc *DeviceConfig) RemoveDevice(name string) bool {
 	for i, device := range dc.Devices {
 		if device.Name == name {
 			dc.Devices = append(dc.Devices[:i], dc.Devices[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// EnableDevice enables a device by name
+func (dc *DeviceConfig) EnableDevice(name string) bool {
+	for i := range dc.Devices {
+		if dc.Devices[i].Name == name {
+			dc.Devices[i].Enabled = true
+			return true
+		}
+	}
+	return false
+}
+
+// DisableDevice disables a device by name
+func (dc *DeviceConfig) DisableDevice(name string) bool {
+	for i := range dc.Devices {
+		if dc.Devices[i].Name == name {
+			dc.Devices[i].Enabled = false
 			return true
 		}
 	}
