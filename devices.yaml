@@ -1,0 +1,63 @@
+# ONVIF Device Configuration
+
+devices:
+  - name: "camera_01"
+    address: "http://192.168.1.100/onvif/device_service"
+    username: "admin"
+    password: "password123"
+    nats_topic: "onvif.camera_01.events"
+    event_types:
+      - "tns1:VideoSource/MotionAlarm"
+      - "tns1:AudioAnalytics/Audio/DetectedSound"
+      - "tns1:Device/Trigger/DigitalInput"
+    metadata:
+      location: "front_door"
+      building: "main_office"
+      floor: "1"
+      zone: "entrance"
+    enabled: true
+
+  - name: "camera_02"
+    address: "http://192.168.1.101/onvif/device_service"
+    username: "admin"
+    password: "password456"
+    nats_topic: "onvif.camera_02.events"
+    event_types: [] # Empty means all event types
+    metadata:
+      location: "parking_lot"
+      building: "main_office"
+      floor: "ground"
+      zone: "exterior"
+    enabled: true
+
+  - name: "camera_03"
+    address: "http://192.168.1.102/onvif/device_service"
+    username: "viewer"
+    password: "viewpass"
+    nats_topic: "onvif.warehouse.events"
+    event_types:
+      - "tns1:VideoSource/MotionAlarm"
+      - "tns1:VideoAnalytics/ObjectDetection"
+    metadata:
+      location: "warehouse"
+      building: "warehouse_a"
+      zone: "loading_dock"
+      camera_type: "ptz"
+    enabled: false  # Disabled device
+
+  - name: "entrance_camera"
+    address: "http://192.168.1.103/onvif/device_service"
+    username: "security"
+    password: "secure123"
+    nats_topic: "onvif.entrance.events"
+    event_types:
+      - "tns1:VideoSource/MotionAlarm"
+      - "tns1:Device/Trigger/DigitalInput"
+      - "tns1:VideoAnalytics/ObjectDetection"
+    metadata:
+      location: "main_entrance"
+      building: "headquarters"
+      floor: "1"
+      zone: "reception"
+      high_priority: "true"
+    enabled: true

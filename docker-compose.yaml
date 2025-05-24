@@ -1,0 +1,236 @@
+version: '3.8'
+
+services:
+  # NATS Server with JetStream
+  nats:
+    image: nats:2.10-alpine
+    container_name: onvif-nats-server
+    ports:
+      - "4222:4222"   # NATS client connections
+      - "8222:8222"   # HTTP monitoring
+      - "6222:6222"   # Routing port for clustering
+    command: [
+      "--name", "onvif-nats-server",
+      "--http_port", "8222",
+      "--port", "4222",
+      "--cluster_name", "onvif-cluster",
+      "--jetstream",
+      "--store_dir", "/data",
+      "--max_memory", "1G",
+      "--max_file_store", "5G",
+      "--log_file", "/var/log/nats/nats.log",
+      "--log_size_limit", "100MB",
+      "--max_log_files", "5"
+    ]
+    volumes:
+      - nats_data:/data
+      - nats_logs:/var/log/nats
+    environment:
+      - NATS_CONFIG_FILE=/etc/nats/nats.conf
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8222/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - onvif-network
+
+  # ONVIF-NATS Gateway
+  onvif-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VERSION: ${VERSION:-dev}
+        BUILD_TIME: ${BUILD_TIME}
+        GO_VERSION: ${GO_VERSION}
+    container_name: onvif-nats-gateway
+    ports:
+      - "8080:8080"   # HTTP API
+    environment:
+      - ONVIF_LOG_LEVEL=${LOG_LEVEL:-info}
+      - ONVIF_NATS_URL=nats://nats:4222
+      - ONVIF_HTTP_PORT=8080
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./devices.yaml:/app/devices.yaml:ro
+      - gateway_logs:/app/logs
+    depends_on:
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    # Use host network for ONVIF device discovery
+    network_mode: host
+    extra_hosts:
+      - "nats:127.0.0.1"  # Point to localhost when using host network
+
+  # Alternative gateway service (without host network)
+  onvif-gateway-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VERSION: ${VERSION:-dev}
+        BUILD_TIME: ${BUILD_TIME}
+        GO_VERSION: ${GO_VERSION}
+    container_name: onvif-nats-gateway-bridge
+    ports:
+      - "8080:8080"
+    environment:
+      - ONVIF_LOG_LEVEL=${LOG_LEVEL:-info}
+      - ONVIF_NATS_URL=nats://nats:4222
+      - ONVIF_HTTP_PORT=8080
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./devices.yaml:/app/devices.yaml:ro
+      - gateway_logs:/app/logs
+    depends_on:
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    networks:
+      - onvif-network
+    profiles:
+      - bridge  # Use this profile if you don't need device discovery
+
+  # NATS CLI tools (for debugging and testing)
+  nats-cli:
+    image: natsio/nats-box:latest
+    container_name: nats-cli-tools
+    depends_on:
+      - nats
+    entrypoint: ["tail", "-f", "/dev/null"]  # Keep container running
+    networks:
+      - onvif-network
+    profiles:
+      - tools
+
+  # Redis (optional - for caching and state management)
+  redis:
+    image: redis:7-alpine
+    container_name: onvif-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - onvif-network
+    profiles:
+      - cache
+
+  # Prometheus (monitoring)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: onvif-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/rules:/etc/prometheus/rules:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=15d'
+      - '--web.enable-lifecycle'
+      - '--web.enable-admin-api'
+    networks:
+      - onvif-network
+    profiles:
+      - monitoring
+
+  # Grafana (visualization)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: onvif-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    depends_on:
+      - prometheus
+    networks:
+      - onvif-network
+    profiles:
+      - monitoring
+
+  # Log aggregation with Loki
+  loki:
+    image: grafana/loki:latest
+    container_name: onvif-loki
+    ports:
+      - "3100:3100"
+    volumes:
+      - loki_data:/tmp/loki
+      - ./monitoring/loki.yml:/etc/loki/local-config.yaml:ro
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - onvif-network
+    profiles:
+      - logging
+
+  # Log shipper
+  promtail:
+    image: grafana/promtail:latest
+    container_name: onvif-promtail
+    volumes:
+      - gateway_logs:/var/log/onvif:ro
+      - nats_logs:/var/log/nats:ro
+      - ./monitoring/promtail.yml:/etc/promtail/config.yml:ro
+    command: -config.file=/etc/promtail/config.yml
+    depends_on:
+      - loki
+    networks:
+      - onvif-network
+    profiles:
+      - logging
+
+volumes:
+  nats_data:
+    driver: local
+  nats_logs:
+    driver: local
+  gateway_logs:
+    driver: local
+  redis_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  loki_data:
+    driver: local
+
+networks:
+  onvif-network:
+    driver: bridge
+    name: onvif-network
