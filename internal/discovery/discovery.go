@@ -3,12 +3,14 @@ package discovery
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
 	"github.com/IOTechSystems/onvif"
+	"github.com/IOTechSystems/onvif/device"
 	wsdiscovery "github.com/IOTechSystems/onvif/ws-discovery"
 
 	"onvif-nats-gateway/internal/config"
@@ -74,23 +76,24 @@ func (s *Service) DiscoverDevices(ctx context.Context) (*DiscoveryResult, error)
 
 	// Process each discovered device
 	for i, discoveredDevice := range discoveredDevices {
+		deviceParams := discoveredDevice.GetDeviceParams()
 		s.logger.WithFields(map[string]interface{}{
 			"device_index": i + 1,
-			"address":      discoveredDevice.XAddr,
+			"address":      deviceParams.Xaddr,
 		}).Debug("Processing discovered device")
 
 		deviceInfo, err := s.getDeviceInfo(ctx, discoveredDevice)
 		if err != nil {
 			errMsg := fmt.Sprintf("Failed to get info for device %s: %v", 
-				discoveredDevice.XAddr, err)
-			s.logger.WithField("address", discoveredDevice.XAddr).
+				deviceParams.Xaddr, err)
+			s.logger.WithField("address", deviceParams.Xaddr).
 				Warn("Failed to retrieve device information")
 			result.Errors = append(result.Errors, errMsg)
 			
 			// Add basic device info even if detailed info fails
 			result.Devices = append(result.Devices, DeviceInfo{
-				Address: discoveredDevice.XAddr,
-				Name:    fmt.Sprintf("ONVIF Device (%s)", extractHostFromURL(discoveredDevice.XAddr)),
+				Address: deviceParams.Xaddr,
+				Name:    fmt.Sprintf("ONVIF Device (%s)", extractHostFromURL(deviceParams.Xaddr)),
 				Metadata: map[string]string{
 					"discovery_error": err.Error(),
 					"discovery_time":  time.Now().Format(time.RFC3339),
@@ -122,92 +125,85 @@ func (s *Service) DiscoverDevices(ctx context.Context) (*DiscoveryResult, error)
 }
 
 // getDeviceInfo retrieves detailed information about a discovered device
-func (s *Service) getDeviceInfo(ctx context.Context, discoveredDevice wsdiscovery.DeviceType) (*DeviceInfo, error) {
-	// Create ONVIF device connection (without authentication for discovery)
-	onvifDevice, err := onvif.NewDevice(onvif.DeviceParams{
-		Xaddr: discoveredDevice.XAddr,
-		// Note: We don't provide credentials during discovery
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create ONVIF device: %w", err)
-	}
-
-	// Try to get device information
+func (s *Service) getDeviceInfo(ctx context.Context, discoveredDevice onvif.Device) (*DeviceInfo, error) {
+	deviceParams := discoveredDevice.GetDeviceParams()
+	
+	// Initialize device info with basic information
 	deviceInfo := &DeviceInfo{
-		Address: discoveredDevice.XAddr,
-		Name:    generateDeviceName(discoveredDevice.XAddr),
+		Address: deviceParams.Xaddr,
+		Name:    generateDeviceName(deviceParams.Xaddr),
 		Metadata: map[string]string{
-			"discovery_url":  discoveredDevice.XAddr,
+			"discovery_url":  deviceParams.Xaddr,
 			"discovery_time": time.Now().Format(time.RFC3339),
 		},
 	}
 
-	// Extract information from discovery scopes
-	s.parseDeviceScopes(deviceInfo, discoveredDevice)
+	// Try to get device information (this may fail without authentication)
+	if err := s.getDeviceInformation(deviceInfo, &discoveredDevice); err != nil {
+		s.logger.WithField("address", deviceParams.Xaddr).
+			Debug("Could not retrieve device information (likely requires authentication)")
+	}
 
-	// Try to get capabilities (may also fail without auth)
-	s.parseDeviceCapabilities(deviceInfo, onvifDevice)
+	// Get capabilities information
+	s.getDeviceCapabilities(deviceInfo, &discoveredDevice)
 
 	return deviceInfo, nil
 }
 
-// parseDeviceScopes extracts device information from WS-Discovery scopes
-func (s *Service) parseDeviceScopes(deviceInfo *DeviceInfo, discoveredDevice wsdiscovery.Device) {
-	// Extract information from discovery scopes
-	// WS-Discovery responses contain device metadata in scopes
-	scopes := discoveredDevice.GetScopes()
+// getDeviceInformation attempts to retrieve device information
+func (s *Service) getDeviceInformation(deviceInfo *DeviceInfo, onvifDevice *onvif.Device) error {
+	// Create GetDeviceInformation request
+	getDeviceInfoReq := device.GetDeviceInformation{}
 	
-	for _, scope := range scopes {
-		scopeStr := strings.ToLower(scope)
-		
-		// Parse common ONVIF scope patterns
-		if strings.Contains(scopeStr, "name/") {
-			parts := strings.Split(scope, "name/")
-			if len(parts) > 1 {
-				deviceInfo.Name = strings.ReplaceAll(parts[1], "_", " ")
-			}
-		}
-		
-		if strings.Contains(scopeStr, "hardware/") {
-			parts := strings.Split(scope, "hardware/")
-			if len(parts) > 1 {
-				deviceInfo.Model = parts[1]
-			}
-		}
-		
-		if strings.Contains(scopeStr, "location/") {
-			parts := strings.Split(scope, "location/")
-			if len(parts) > 1 {
-				deviceInfo.Metadata["location"] = parts[1]
-			}
-		}
-
-		// Store all scopes for reference
-		if deviceInfo.Metadata["scopes"] == "" {
-			deviceInfo.Metadata["scopes"] = scope
-		} else {
-			deviceInfo.Metadata["scopes"] += ";" + scope
-		}
+	// Call the method
+	response, err := onvifDevice.CallMethod(getDeviceInfoReq)
+	if err != nil {
+		return fmt.Errorf("GetDeviceInformation failed: %w", err)
 	}
 
-	// Set default name if not found in scopes
-	if deviceInfo.Name == "" || strings.Contains(deviceInfo.Name, "ONVIF Device") {
-		deviceInfo.Name = fmt.Sprintf("ONVIF Camera (%s)", extractHostFromURL(deviceInfo.Address))
+	// Read the response body
+	bodyBytes, err := io.ReadAll(response.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response body: %w", err)
 	}
+	response.Body.Close()
+
+	// Try to extract information from response
+	// Note: This is simplified parsing - in production you'd want more robust XML parsing
+	responseStr := string(bodyBytes)
+	
+	// Extract basic information using simple string parsing
+	// In production, use proper XML unmarshaling
+	if manufacturer := extractXMLValue(responseStr, "Manufacturer"); manufacturer != "" {
+		deviceInfo.Manufacturer = manufacturer
+	}
+	if model := extractXMLValue(responseStr, "Model"); model != "" {
+		deviceInfo.Model = model
+	}
+	if firmware := extractXMLValue(responseStr, "FirmwareVersion"); firmware != "" {
+		deviceInfo.Firmware = firmware
+	}
+	if serial := extractXMLValue(responseStr, "SerialNumber"); serial != "" {
+		deviceInfo.Serial = serial
+	}
+
+	// Update device name if we have manufacturer and model
+	if deviceInfo.Manufacturer != "" && deviceInfo.Model != "" {
+		deviceInfo.Name = fmt.Sprintf("%s %s", deviceInfo.Manufacturer, deviceInfo.Model)
+	}
+
+	return nil
 }
 
-// parseDeviceCapabilities attempts to get device capabilities
-func (s *Service) parseDeviceCapabilities(deviceInfo *DeviceInfo, onvifDevice *onvif.Device) {
-	// Try to get capabilities without authentication
-	// This may fail, but we'll attempt it for completeness
+// getDeviceCapabilities attempts to get device capabilities
+func (s *Service) getDeviceCapabilities(deviceInfo *DeviceInfo, onvifDevice *onvif.Device) {
+	// Set default capabilities that all ONVIF devices should support
+	capabilities := []string{"device"}
 	
-	capabilities := []string{"device"} // All ONVIF devices support device service
-	
-	// Common ONVIF capabilities based on typical camera features
-	// In a real implementation, this would query GetCapabilities
+	// Try to get more detailed capabilities (may fail without auth)
+	// For now, we'll set common ONVIF capabilities
 	capabilities = append(capabilities, "media", "events")
 	
-	// Set default capabilities
 	deviceInfo.Capabilities = capabilities
 	deviceInfo.Metadata["capabilities_note"] = "Default capabilities - authentication required for full discovery"
 }
@@ -228,7 +224,7 @@ func (s *Service) GenerateDeviceConfig(result *DiscoveryResult, defaultUsername,
 			Password:   defaultPassword,
 			NATSTopic:  generateNATSTopic(deviceInfo, i),
 			EventTypes: getDefaultEventTypes(deviceInfo),
-			Metadata:   deviceInfo.Metadata,
+			Metadata:   copyMetadata(deviceInfo.Metadata),
 			Enabled:    false, // Disabled by default for security
 		}
 
@@ -267,10 +263,9 @@ func (s *Service) SaveDiscoveryReport(result *DiscoveryResult, filename string) 
 
 // Utility functions
 
-// generateDeviceName creates a human-readable device name
-func generateDeviceName(params onvif.DeviceParams) string {
-	// Extract hostname/IP from address for basic naming
-	host := extractHostFromURL(params.Xaddr)
+// generateDeviceName creates a human-readable device name from address
+func generateDeviceName(address string) string {
+	host := extractHostFromURL(address)
 	return fmt.Sprintf("ONVIF Camera (%s)", host)
 }
 
@@ -360,4 +355,36 @@ func sanitizeName(name string) string {
 		return "unknown"
 	}
 	return cleaned
+}
+
+// extractXMLValue extracts a value from XML using simple string parsing
+func extractXMLValue(xmlStr, tagName string) string {
+	startTag := fmt.Sprintf("<%s>", tagName)
+	endTag := fmt.Sprintf("</%s>", tagName)
+	
+	startIdx := strings.Index(xmlStr, startTag)
+	if startIdx == -1 {
+		return ""
+	}
+	startIdx += len(startTag)
+	
+	endIdx := strings.Index(xmlStr[startIdx:], endTag)
+	if endIdx == -1 {
+		return ""
+	}
+	
+	return strings.TrimSpace(xmlStr[startIdx : startIdx+endIdx])
+}
+
+// copyMetadata creates a copy of metadata map
+func copyMetadata(original map[string]string) map[string]string {
+	if original == nil {
+		return make(map[string]string)
+	}
+	
+	copy := make(map[string]string, len(original))
+	for k, v := range original {
+		copy[k] = v
+	}
+	return copy
 }

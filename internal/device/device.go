@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/xml"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"time"
@@ -11,7 +12,8 @@ import (
 	"github.com/IOTechSystems/onvif"
 	"github.com/IOTechSystems/onvif/device"
 	"github.com/IOTechSystems/onvif/event"
-	"github.com/IOTechSystems/onvif/ws-discovery"
+	"github.com/IOTechSystems/onvif/xsd"
+	wsdiscovery "github.com/IOTechSystems/onvif/ws-discovery"
 	
 	"onvif-nats-gateway/internal/config"
 	"onvif-nats-gateway/internal/constants"
@@ -60,6 +62,16 @@ type ONVIFDeviceInformation struct {
 	FirmwareVersion string `xml:"FirmwareVersion"`
 	SerialNumber   string `xml:"SerialNumber"`
 	HardwareId     string `xml:"HardwareId"`
+}
+
+// ResponseEnvelope represents the SOAP response envelope
+type ResponseEnvelope struct {
+	Body ResponseBody `xml:"Body"`
+}
+
+// ResponseBody represents the SOAP response body
+type ResponseBody struct {
+	Content []byte `xml:",innerxml"`
 }
 
 // NewManager creates a new device manager
@@ -226,9 +238,15 @@ func (m *Manager) testDeviceConnection(dev *Device) error {
 		return fmt.Errorf("GetDeviceInformation failed: %w", err)
 	}
 
+	// Read response body
+	bodyBytes, err := m.readResponseBody(response.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response body: %w", err)
+	}
+
 	// Parse device information from response
 	var deviceInfo ONVIFDeviceInformation
-	if err := xml.Unmarshal(response.Body, &deviceInfo); err != nil {
+	if err := xml.Unmarshal(bodyBytes, &deviceInfo); err != nil {
 		dev.logger.WithField("error", err.Error()).Warn("Failed to parse device information, but connection is working")
 	} else {
 		dev.logger.WithFields(map[string]interface{}{
@@ -291,9 +309,11 @@ func (m *Manager) handleEventSubscription(dev *Device) error {
 	}
 	dev.mu.Unlock()
 
-	// Create PullPoint subscription
+	// Create PullPoint subscription with proper XSD types
+	durationStr := formatDurationToXSD(m.appConfig.ONVIF.SubscriptionRenew)
+	termTime := xsd.String(durationStr)
 	createSubscription := event.CreatePullPointSubscription{
-		InitialTerminationTime: formatDuration(m.appConfig.ONVIF.SubscriptionRenew),
+		InitialTerminationTime: &termTime,
 	}
 
 	response, err := dev.Client.CallMethod(createSubscription)
@@ -301,8 +321,13 @@ func (m *Manager) handleEventSubscription(dev *Device) error {
 		return fmt.Errorf("failed to create PullPoint subscription: %w", err)
 	}
 
-	// Parse subscription response to get subscription address
-	subscriptionAddr, err := m.parseSubscriptionResponse(response.Body)
+	// Read and parse subscription response
+	bodyBytes, err := m.readResponseBody(response.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read subscription response: %w", err)
+	}
+
+	subscriptionAddr, err := m.parseSubscriptionResponse(bodyBytes)
 	if err != nil {
 		return fmt.Errorf("failed to parse subscription response: %w", err)
 	}
@@ -349,9 +374,10 @@ func (m *Manager) handleEventSubscription(dev *Device) error {
 
 // pullEvents pulls event messages from the ONVIF device
 func (m *Manager) pullEvents(dev *Device) error {
+	timeoutStr := formatDurationToXSD(m.appConfig.ONVIF.EventPullTimeout)
 	pullMessages := event.PullMessages{
 		MessageLimit: 100,
-		Timeout:      formatDuration(m.appConfig.ONVIF.EventPullTimeout),
+		Timeout:      xsd.Duration(timeoutStr),
 	}
 
 	response, err := dev.Client.CallMethod(pullMessages)
@@ -359,8 +385,13 @@ func (m *Manager) pullEvents(dev *Device) error {
 		return fmt.Errorf("PullMessages failed: %w", err)
 	}
 
-	// Parse and process event notifications
-	notifications, err := m.parseEventNotifications(response.Body)
+	// Read and parse event notifications
+	bodyBytes, err := m.readResponseBody(response.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read pull response: %w", err)
+	}
+
+	notifications, err := m.parseEventNotifications(bodyBytes)
 	if err != nil {
 		dev.logger.WithField("error", err.Error()).Warn("Failed to parse event notifications")
 		return nil // Don't fail the subscription for parse errors
@@ -376,8 +407,9 @@ func (m *Manager) pullEvents(dev *Device) error {
 
 // renewSubscription renews the ONVIF event subscription
 func (m *Manager) renewSubscription(dev *Device) error {
+	durationStr := formatDurationToXSD(m.appConfig.ONVIF.SubscriptionRenew)
 	renewReq := event.Renew{
-		TerminationTime: formatDuration(m.appConfig.ONVIF.SubscriptionRenew),
+		TerminationTime: xsd.String(durationStr),
 	}
 
 	_, err := dev.Client.CallMethod(renewReq)
@@ -398,6 +430,12 @@ func (m *Manager) unsubscribeFromEvents(dev *Device) {
 	}
 }
 
+// readResponseBody reads the response body and closes it
+func (m *Manager) readResponseBody(body io.ReadCloser) ([]byte, error) {
+	defer body.Close()
+	return io.ReadAll(body)
+}
+
 // parseSubscriptionResponse parses the subscription response to extract the subscription address
 func (m *Manager) parseSubscriptionResponse(responseBody []byte) (string, error) {
 	// This is a simplified parser - in production you'd want more robust XML parsing
@@ -406,7 +444,7 @@ func (m *Manager) parseSubscriptionResponse(responseBody []byte) (string, error)
 	// Look for subscription reference address in the response
 	if strings.Contains(responseStr, "SubscriptionReference") {
 		// Extract address from XML - this is simplified
-		// In production, use proper XML parsing
+		// In production, use proper XML parsing with structs
 		return "subscription_created", nil
 	}
 	
@@ -416,14 +454,15 @@ func (m *Manager) parseSubscriptionResponse(responseBody []byte) (string, error)
 // parseEventNotifications parses event notifications from the response
 func (m *Manager) parseEventNotifications(responseBody []byte) ([]map[string]interface{}, error) {
 	// This is a simplified parser for demonstration
-	// In production, you'd implement proper ONVIF event XML parsing
+	// In production, you'd implement proper ONVIF event XML parsing with structs
 	
 	var notifications []map[string]interface{}
 	responseStr := string(responseBody)
 	
 	// Look for notification messages in the response
 	if strings.Contains(responseStr, "NotificationMessage") {
-		// For demonstration, create a sample notification
+		// For demonstration, create sample notifications
+		// In production, parse the actual XML structure
 		notification := map[string]interface{}{
 			"Topic":     "tns1:VideoSource/MotionAlarm",
 			"Message":   "Motion detected",
@@ -444,7 +483,7 @@ func (m *Manager) processEvents(dev *Device, notifications []map[string]interfac
 			DeviceAddr: dev.Config.Address,
 			Timestamp:  time.Now(),
 			Topic:      dev.Config.NATSTopic,
-			Metadata:   dev.Config.Metadata,
+			Metadata:   copyStringMap(dev.Config.Metadata),
 			Data:       notification,
 		}
 
@@ -457,14 +496,7 @@ func (m *Manager) processEvents(dev *Device, notifications []map[string]interfac
 
 		// Filter events by configured types if specified
 		if len(dev.Config.EventTypes) > 0 {
-			found := false
-			for _, eventType := range dev.Config.EventTypes {
-				if eventType == eventData.EventType {
-					found = true
-					break
-				}
-			}
-			if !found {
+			if !m.isEventTypeAllowed(eventData.EventType, dev.Config.EventTypes) {
 				continue // Skip this event
 			}
 		}
@@ -482,6 +514,16 @@ func (m *Manager) processEvents(dev *Device, notifications []map[string]interfac
 			dev.logger.Warn("Event channel full, dropping ONVIF event")
 		}
 	}
+}
+
+// isEventTypeAllowed checks if an event type is in the allowed list
+func (m *Manager) isEventTypeAllowed(eventType string, allowedTypes []string) bool {
+	for _, allowedType := range allowedTypes {
+		if allowedType == eventType {
+			return true
+		}
+	}
+	return false
 }
 
 // monitorDevices monitors device health and connectivity
@@ -528,8 +570,8 @@ func (m *Manager) GetDeviceStatus() map[string]bool {
 
 // Utility functions
 
-// formatDuration formats a Go duration for ONVIF XML (ISO 8601 duration format)
-func formatDuration(d time.Duration) string {
+// formatDurationToXSD formats a Go duration for ONVIF XML (ISO 8601 duration format)
+func formatDurationToXSD(d time.Duration) string {
 	// Convert to ISO 8601 duration format (PT30S for 30 seconds, PT5M for 5 minutes)
 	seconds := int(d.Seconds())
 	if seconds < 60 {
@@ -541,4 +583,17 @@ func formatDuration(d time.Duration) string {
 	}
 	hours := minutes / 60
 	return fmt.Sprintf("PT%dH", hours)
+}
+
+// copyStringMap creates a copy of a string map
+func copyStringMap(original map[string]string) map[string]string {
+	if original == nil {
+		return make(map[string]string)
+	}
+	
+	copy := make(map[string]string, len(original))
+	for k, v := range original {
+		copy[k] = v
+	}
+	return copy
 }
