@@ -279,26 +279,39 @@ func (app *Application) Start() error {
 
 // Stop gracefully stops all application components
 func (app *Application) Stop() {
-	app.logger.Info("Stopping application components")
-
-	// Stop API server
-	ctx, cancel := context.WithTimeout(context.Background(), constants.GracefulShutdownTimeout)
-	defer cancel()
-	
-	if err := app.apiServer.Stop(ctx); err != nil {
-		app.logger.WithField("error", err.Error()).Error("Failed to stop API server gracefully")
+	if app.logger != nil {
+		app.logger.Info("Stopping application components")
 	}
 
-	// Stop device manager
-	app.deviceManager.Stop()
+	// Stop API server first to prevent new requests
+	if app.apiServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), constants.GracefulShutdownTimeout)
+		defer cancel()
+		
+		if err := app.apiServer.Stop(ctx); err != nil && app.logger != nil {
+			app.logger.WithField("error", err.Error()).Error("Failed to stop API server gracefully")
+		}
+	}
 
-	// Stop NATS client
-	app.natsClient.Stop()
+	// Stop device manager to prevent new events
+	if app.deviceManager != nil {
+		app.deviceManager.Stop()
+	}
 
-	// Close event channel
-	close(app.eventChan)
+	// Close event channel to signal NATS workers to stop
+	if app.eventChan != nil {
+		close(app.eventChan)
+		app.eventChan = nil
+	}
 
-	app.logger.Info("Application stopped successfully")
+	// Stop NATS client last to ensure all events are published
+	if app.natsClient != nil {
+		app.natsClient.Stop()
+	}
+
+	if app.logger != nil {
+		app.logger.Info("Application stopped successfully")
+	}
 }
 
 // setupGracefulShutdown sets up graceful shutdown handling
@@ -313,8 +326,13 @@ func setupGracefulShutdown(app *Application, log *logger.Logger) {
 		// Graceful shutdown with timeout
 		shutdownComplete := make(chan struct{})
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.WithField("panic", r).Error("Panic during shutdown")
+				}
+				close(shutdownComplete)
+			}()
 			app.Stop()
-			close(shutdownComplete)
 		}()
 
 		select {

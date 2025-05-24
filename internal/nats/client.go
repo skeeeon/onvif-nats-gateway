@@ -55,23 +55,35 @@ func NewClient(cfg *config.NATSConfig, eventChan <-chan *device.EventData) *Clie
 func (c *Client) Connect() error {
 	c.logger.WithField("server_url", c.config.URL).Info("Connecting to NATS server")
 
-	// Configure NATS options
+	// Configure NATS options with safe callback handlers
 	opts := []nats.Option{
 		nats.Name(constants.AppName),
 		nats.Timeout(c.config.ConnectionTimeout),
 		nats.ReconnectWait(c.config.ReconnectWait),
 		nats.MaxReconnects(c.config.MaxReconnects),
 		nats.DisconnectErrHandler(func(nc *nats.Conn, err error) {
-			c.logger.WithField("error", err.Error()).Warn("NATS disconnected")
+			// Safe callback - check for nil pointers during shutdown
+			if c != nil && c.logger != nil && err != nil {
+				c.logger.WithField("error", err.Error()).Warn("NATS disconnected")
+			}
 		}),
 		nats.ReconnectHandler(func(nc *nats.Conn) {
-			c.logger.WithField("server_url", nc.ConnectedUrl()).Info("NATS reconnected")
+			// Safe callback - check for nil pointers during shutdown
+			if c != nil && c.logger != nil && nc != nil {
+				c.logger.WithField("server_url", nc.ConnectedUrl()).Info("NATS reconnected")
+			}
 		}),
 		nats.ClosedHandler(func(nc *nats.Conn) {
-			c.logger.Info("NATS connection closed")
+			// Safe callback - check for nil pointers during shutdown
+			if c != nil && c.logger != nil {
+				c.logger.Info("NATS connection closed")
+			}
 		}),
 		nats.ErrorHandler(func(nc *nats.Conn, sub *nats.Subscription, err error) {
-			c.logger.WithField("error", err.Error()).Error("NATS error")
+			// Safe callback - check for nil pointers during shutdown
+			if c != nil && c.logger != nil && err != nil {
+				c.logger.WithField("error", err.Error()).Error("NATS error")
+			}
 		}),
 	}
 
@@ -112,14 +124,45 @@ func (c *Client) Start() error {
 
 // Stop gracefully shuts down the NATS client
 func (c *Client) Stop() {
-	c.logger.Info("Stopping NATS client")
+	if c.logger != nil {
+		c.logger.Info("Stopping NATS client")
+	}
 	
-	c.cancel()
-	c.wg.Wait()
+	// Cancel context to stop workers
+	if c.cancel != nil {
+		c.cancel()
+	}
 
+	// Wait for workers to finish with timeout
+	done := make(chan struct{})
+	go func() {
+		c.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Workers finished gracefully
+	case <-time.After(5 * time.Second):
+		// Timeout waiting for workers
+		if c.logger != nil {
+			c.logger.Warn("Timeout waiting for NATS workers to finish")
+		}
+	}
+
+	// Close NATS connection safely
 	if c.conn != nil {
+		// Flush any pending messages with timeout
+		if err := c.conn.FlushTimeout(2 * time.Second); err != nil && c.logger != nil {
+			c.logger.WithField("error", err.Error()).Warn("Failed to flush NATS messages during shutdown")
+		}
+		
 		c.conn.Close()
-		c.logger.Info("NATS connection closed")
+		c.conn = nil
+		
+		if c.logger != nil {
+			c.logger.Info("NATS connection closed")
+		}
 	}
 }
 
@@ -142,19 +185,30 @@ func (c *Client) eventProcessor(workerID int) {
 				return
 			}
 
+			// Check if we're still connected and context is valid
+			if c.ctx.Err() != nil {
+				workerLogger.Debug("Context cancelled, skipping event processing")
+				return
+			}
+
 			if err := c.publishEvent(eventData); err != nil {
-				workerLogger.WithFields(map[string]interface{}{
-					"error":       err.Error(),
-					"device_name": eventData.DeviceName,
-					"topic":       eventData.Topic,
-				}).Error("Failed to publish event")
+				// Only log if we're not shutting down
+				if c.ctx.Err() == nil && c.logger != nil {
+					workerLogger.WithFields(map[string]interface{}{
+						"error":       err.Error(),
+						"device_name": eventData.DeviceName,
+						"topic":       eventData.Topic,
+					}).Error("Failed to publish event")
+				}
 				c.updateStats(false, err.Error())
 			} else {
-				workerLogger.WithFields(map[string]interface{}{
-					"device_name": eventData.DeviceName,
-					"topic":       eventData.Topic,
-					"event_type":  eventData.EventType,
-				}).Debug("Published event")
+				if c.ctx.Err() == nil && c.logger != nil {
+					workerLogger.WithFields(map[string]interface{}{
+						"device_name": eventData.DeviceName,
+						"topic":       eventData.Topic,
+						"event_type":  eventData.EventType,
+					}).Debug("Published event")
+				}
 				c.updateStats(true, "")
 			}
 		}
@@ -163,6 +217,20 @@ func (c *Client) eventProcessor(workerID int) {
 
 // publishEvent publishes a single event to NATS
 func (c *Client) publishEvent(eventData *device.EventData) error {
+	// Check if connection is still valid
+	if c.conn == nil {
+		return fmt.Errorf("NATS connection is nil")
+	}
+
+	if !c.conn.IsConnected() {
+		return fmt.Errorf("NATS connection is not active")
+	}
+
+	// Check if context is cancelled (shutting down)
+	if c.ctx.Err() != nil {
+		return fmt.Errorf("client is shutting down")
+	}
+
 	// Convert event data to JSON
 	payload, err := json.Marshal(eventData)
 	if err != nil {
@@ -183,6 +251,10 @@ func (c *Client) PublishEventDirect(topic string, data interface{}) error {
 		return fmt.Errorf("NATS connection not established")
 	}
 
+	if !c.conn.IsConnected() {
+		return fmt.Errorf("NATS connection is not active")
+	}
+
 	payload, err := json.Marshal(data)
 	if err != nil {
 		return fmt.Errorf("failed to marshal data: %w", err)
@@ -197,6 +269,10 @@ func (c *Client) Request(subject string, data []byte, timeout time.Duration) (*n
 		return nil, fmt.Errorf("NATS connection not established")
 	}
 
+	if !c.conn.IsConnected() {
+		return nil, fmt.Errorf("NATS connection is not active")
+	}
+
 	return c.conn.Request(subject, data, timeout)
 }
 
@@ -206,6 +282,10 @@ func (c *Client) Subscribe(subject string, handler nats.MsgHandler) (*nats.Subsc
 		return nil, fmt.Errorf("NATS connection not established")
 	}
 
+	if !c.conn.IsConnected() {
+		return nil, fmt.Errorf("NATS connection is not active")
+	}
+
 	return c.conn.Subscribe(subject, handler)
 }
 
@@ -213,6 +293,10 @@ func (c *Client) Subscribe(subject string, handler nats.MsgHandler) (*nats.Subsc
 func (c *Client) QueueSubscribe(subject, queue string, handler nats.MsgHandler) (*nats.Subscription, error) {
 	if c.conn == nil {
 		return nil, fmt.Errorf("NATS connection not established")
+	}
+
+	if !c.conn.IsConnected() {
+		return nil, fmt.Errorf("NATS connection is not active")
 	}
 
 	return c.conn.QueueSubscribe(subject, queue, handler)
@@ -227,11 +311,15 @@ func (c *Client) IsConnected() bool {
 func (c *Client) GetConnectionStatus() map[string]interface{} {
 	if c.conn == nil {
 		return map[string]interface{}{
-			"connected":    false,
-			"status":       "not_initialized",
-			"server_url":   "",
-			"client_id":    "",
-			"last_error":   "",
+			"connected":         false,
+			"status":           "not_initialized",
+			"server_url":       "",
+			"client_id":        "",
+			"last_error":       "",
+			"bytes_sent":       0,
+			"bytes_received":   0,
+			"messages_sent":    0,
+			"messages_received": 0,
 		}
 	}
 
@@ -269,8 +357,13 @@ func (c *Client) GetPublishStats() PublishStats {
 	}
 }
 
-// updateStats updates publishing statistics
+// updateStats updates publishing statistics safely
 func (c *Client) updateStats(success bool, errorMsg string) {
+	// Skip stats updates if we're shutting down
+	if c.ctx != nil && c.ctx.Err() != nil {
+		return
+	}
+
 	stats.mu.Lock()
 	defer stats.mu.Unlock()
 
@@ -290,6 +383,10 @@ func (c *Client) Flush() error {
 		return fmt.Errorf("NATS connection not established")
 	}
 
+	if !c.conn.IsConnected() {
+		return fmt.Errorf("NATS connection is not active")
+	}
+
 	return c.conn.Flush()
 }
 
@@ -297,6 +394,10 @@ func (c *Client) Flush() error {
 func (c *Client) FlushTimeout(timeout time.Duration) error {
 	if c.conn == nil {
 		return fmt.Errorf("NATS connection not established")
+	}
+
+	if !c.conn.IsConnected() {
+		return fmt.Errorf("NATS connection is not active")
 	}
 
 	return c.conn.FlushTimeout(timeout)
