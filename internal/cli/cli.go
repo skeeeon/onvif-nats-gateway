@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -160,7 +161,7 @@ func (c *CLI) registerCommands() {
 		Description: "Test connectivity to a specific device",
 		Handler:     c.handleTestConnection,
 		Flags: []Flag{
-			{Name: "address", Description: "Device ONVIF service URL", Default: "", Required: true},
+			{Name: "address", Description: "Device ONVIF service URL or host:port", Default: "", Required: true},
 			{Name: "username", Description: "Username for authentication", Default: "admin"},
 			{Name: "password", Description: "Password for authentication", Default: "", Required: true},
 			{Name: "verbose", Description: "Enable verbose output", Default: false},
@@ -422,8 +423,8 @@ func (c *CLI) handleGenerateConfig(ctx *Context) error {
 		
 		fmt.Printf("\nNext steps:\n")
 		fmt.Printf("1. Edit %s and set 'enabled: true' for devices you want to monitor\n", outputFile)
-		fmt.Printf("2. Verify device addresses are correct (auto-generated with common ONVIF paths)\n")
-		fmt.Printf("3. Test connectivity with: curl -u admin:password 'http://IP:PORT/onvif/device_service'\n")
+		fmt.Printf("2. Verify device addresses are correct (normalized to host:port format)\n")
+		fmt.Printf("3. Test connectivity with: %s test-connection -address HOST:PORT -username admin -password PASSWORD\n", constants.AppName)
 		fmt.Printf("4. Run the gateway: %s -devices %s\n", constants.AppName, outputFile)
 	} else {
 		fmt.Printf("\nNo devices found. Try:\n")
@@ -479,8 +480,8 @@ func (c *CLI) handleFixConfig(ctx *Context) error {
 		device := &deviceConfig.Devices[i]
 		originalAddr := device.Address
 		
-		// Normalize the address
-		normalizedAddr := c.normalizeONVIFAddress(originalAddr)
+		// Normalize the address using the new method
+		normalizedAddr := c.normalizeAddressForLibrary(originalAddr)
 		
 		if originalAddr != normalizedAddr {
 			fmt.Printf("Fixed device[%d] %s:\n", i, device.Name)
@@ -515,26 +516,22 @@ func (c *CLI) handleFixConfig(ctx *Context) error {
 	return nil
 }
 
-// normalizeONVIFAddress ensures the address is a properly formatted ONVIF service URL
-func (c *CLI) normalizeONVIFAddress(address string) string {
-	// If already a complete URL, return as-is
-	if strings.HasPrefix(address, "http://") || strings.HasPrefix(address, "https://") {
-		return address
+// normalizeAddressForLibrary converts various address formats to the host:port format expected by the IOTechSystems/onvif library
+func (c *CLI) normalizeAddressForLibrary(address string) string {
+	// Remove protocol prefix if present
+	addr := strings.TrimPrefix(address, "http://")
+	addr = strings.TrimPrefix(addr, "https://")
+	
+	// Split on first slash to get host:port part
+	parts := strings.Split(addr, "/")
+	hostPort := parts[0]
+	
+	// If no port specified, add default ONVIF port
+	if !strings.Contains(hostPort, ":") {
+		hostPort = hostPort + ":80"
 	}
 	
-	// If it's just IP:port, construct proper ONVIF service URL
-	if strings.Contains(address, ":") && !strings.Contains(address, "://") {
-		// Add http:// prefix and common ONVIF service path
-		return fmt.Sprintf("http://%s/onvif/device_service", address)
-	}
-	
-	// If it's just an IP address, add default port and service path
-	if !strings.Contains(address, ":") {
-		return fmt.Sprintf("http://%s:80/onvif/device_service", address)
-	}
-	
-	// Fallback - add http:// prefix
-	return fmt.Sprintf("http://%s", address)
+	return hostPort
 }
 
 // handleValidateConfig handles the validate command
@@ -596,7 +593,7 @@ func (c *CLI) showUsage() {
 	fmt.Printf("  %s generate-config -username admin -password pass  # Generate device config\n", constants.AppName)
 	fmt.Printf("  %s list-devices                                # List all configured devices\n", constants.AppName)
 	fmt.Printf("  %s enable-device -name camera_01               # Enable a specific device\n", constants.AppName)
-	fmt.Printf("  %s test-connection -address http://IP:PORT/onvif/device_service -username admin -password pass  # Test device connectivity\n", constants.AppName)
+	fmt.Printf("  %s test-connection -address 192.168.1.100:80 -username admin -password pass  # Test device connectivity\n", constants.AppName)
 	fmt.Printf("  %s fix-config                                  # Fix device addresses in config\n", constants.AppName)
 	fmt.Printf("  %s validate                                    # Validate configuration\n", constants.AppName)
 	fmt.Printf("  %s -config app.yaml -devices devices.yaml     # Run with custom configs\n", constants.AppName)
@@ -668,6 +665,7 @@ func (c *CLI) printDiscoveryResults(result *discovery.DiscoveryResult) {
 	fmt.Printf("Next steps:\n")
 	fmt.Printf("• Use 'generate-config' command to create device configuration\n")
 	fmt.Printf("• Manually configure devices in devices.yaml\n")
+	fmt.Printf("• Test connectivity with 'test-connection' command\n")
 }
 
 // handleEnableDevice handles the enable-device command
@@ -815,19 +813,25 @@ func (c *CLI) handleTestConnection(ctx *Context) error {
 
 // testBasicHTTP tests basic HTTP connectivity
 func (c *CLI) testBasicHTTP(address, username, password string) error {
+	// Build full URL if just host:port provided
+	testURL := address
+	if !strings.HasPrefix(address, "http://") && !strings.HasPrefix(address, "https://") {
+		testURL = fmt.Sprintf("http://%s", address)
+	}
+
 	httpClient := &http.Client{
 		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
-			Dial: (&net.Dialer{
+			DialContext: (&net.Dialer{
 				Timeout: 5 * time.Second,
-			}).Dial,
+			}).DialContext,
 			TLSHandshakeTimeout:   5 * time.Second,
 			ResponseHeaderTimeout: 5 * time.Second,
 			TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
 		},
 	}
 
-	req, err := http.NewRequest("GET", address, nil)
+	req, err := http.NewRequest("GET", testURL, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create HTTP request: %w", err)
 	}
@@ -849,64 +853,180 @@ func (c *CLI) testBasicHTTP(address, username, password string) error {
 	return nil
 }
 
-// testONVIFConnection tests ONVIF device creation and basic functionality
+// testONVIFConnection tests ONVIF device creation and basic functionality using proper library patterns
 func (c *CLI) testONVIFConnection(address, username, password string, verbose bool) error {
-	// Create custom HTTP client
+	// Normalize address to the format expected by IOTechSystems/onvif library
+	deviceAddr := c.normalizeAddressForLibrary(address)
+	
+	if verbose {
+		fmt.Printf("   Original address: %s\n", address)
+		fmt.Printf("   Normalized address: %s\n", deviceAddr)
+	}
+
+	// Create custom HTTP client with proper timeouts and modern transport
 	httpClient := &http.Client{
 		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
-			Dial: (&net.Dialer{
-				Timeout: 10 * time.Second,
-			}).Dial,
+			DialContext: (&net.Dialer{
+				Timeout:   10 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
 			TLSHandshakeTimeout:   10 * time.Second,
 			ResponseHeaderTimeout: 15 * time.Second,
-			TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
+			ExpectContinueTimeout: 1 * time.Second,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			// Skip TLS verification for cameras with self-signed certificates
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		},
 	}
 
-	// Try different authentication methods
-	authMethods := []string{"digest", "ws-security", ""}
-	
-	for _, authMode := range authMethods {
-		authName := authMode
-		if authName == "" {
-			authName = "default"
-		}
-		fmt.Printf("   Trying %s authentication...\n", authName)
+	fmt.Printf("   Creating ONVIF device client...\n")
 
-		deviceParams := onvif.DeviceParams{
-			Xaddr:      address,
-			Username:   username,
-			Password:   password,
-			HttpClient: httpClient,
-			AuthMode:   authMode,
-		}
-
-		onvifDevice, err := onvif.NewDevice(deviceParams)
-		if err != nil {
-			if verbose {
-				fmt.Printf("   ⚠️  %s auth failed: %v\n", authName, err)
-			}
-			continue
-		}
-
-		// Test GetDeviceInformation
-		fmt.Printf("   ✅ Device created with %s auth\n", authName)
-		
-		getDeviceInfoReq := device.GetDeviceInformation{}
-		response, err := onvifDevice.CallMethod(getDeviceInfoReq)
-		if err != nil {
-			fmt.Printf("   ⚠️  GetDeviceInformation failed: %v\n", err)
-			continue
-		}
-
-		fmt.Printf("   ✅ GetDeviceInformation successful\n")
-		fmt.Printf("   Response Status: %d\n", response.StatusCode)
-		
-		return nil
+	// Create device parameters - let the library handle authentication method detection
+	deviceParams := onvif.DeviceParams{
+		Xaddr:      deviceAddr,
+		Username:   username,
+		Password:   password,
+		HttpClient: httpClient,
+		// Don't set AuthMode explicitly - let library auto-detect
 	}
 
-	return fmt.Errorf("all authentication methods failed")
+	if verbose {
+		fmt.Printf("   Device parameters:\n")
+		fmt.Printf("     Xaddr: %s\n", deviceParams.Xaddr)
+		fmt.Printf("     Username: %s\n", deviceParams.Username)
+		fmt.Printf("     Has password: %t\n", len(deviceParams.Password) > 0)
+	}
+
+	// Create ONVIF device - this automatically calls GetCapabilities
+	onvifDevice, err := onvif.NewDevice(deviceParams)
+	if err != nil {
+		return fmt.Errorf("failed to create ONVIF device: %w", err)
+	}
+
+	fmt.Printf("   ✅ ONVIF device created successfully\n")
+
+	// Test GetDeviceInformation
+	fmt.Printf("   Testing GetDeviceInformation...\n")
+	getDeviceInfoReq := device.GetDeviceInformation{}
+	response, err := onvifDevice.CallMethod(getDeviceInfoReq)
+	if err != nil {
+		return fmt.Errorf("GetDeviceInformation failed: %w", err)
+	}
+
+	fmt.Printf("   ✅ GetDeviceInformation successful\n")
+	if verbose {
+		fmt.Printf("     Response Status: %d\n", response.StatusCode)
+		fmt.Printf("     Content-Type: %s\n", response.Header.Get("Content-Type"))
+		fmt.Printf("     Content-Length: %d\n", response.ContentLength)
+	}
+
+	// Read and parse device information
+	bodyBytes, err := io.ReadAll(response.Body)
+	if err != nil {
+		fmt.Printf("   ⚠️  Failed to read response body: %v\n", err)
+	} else {
+		response.Body.Close()
+		
+		// Try to extract device information
+		if manufacturer := c.extractXMLValue(string(bodyBytes), "Manufacturer"); manufacturer != "" {
+			fmt.Printf("   📋 Manufacturer: %s\n", manufacturer)
+		}
+		if model := c.extractXMLValue(string(bodyBytes), "Model"); model != "" {
+			fmt.Printf("   📋 Model: %s\n", model)
+		}
+		if firmware := c.extractXMLValue(string(bodyBytes), "FirmwareVersion"); firmware != "" {
+			fmt.Printf("   📋 Firmware: %s\n", firmware)
+		}
+		if serial := c.extractXMLValue(string(bodyBytes), "SerialNumber"); serial != "" {
+			fmt.Printf("   📋 Serial: %s\n", serial)
+		}
+		
+		if verbose {
+			fmt.Printf("   Response preview: %s\n", string(bodyBytes[:min(300, len(bodyBytes))]))
+		}
+	}
+
+	// Test GetCapabilities
+	fmt.Printf("   Testing GetCapabilities...\n")
+	getCapabilitiesReq := device.GetCapabilities{Category: "All"}
+	response, err = onvifDevice.CallMethod(getCapabilitiesReq)
+	if err != nil {
+		fmt.Printf("   ⚠️  GetCapabilities failed: %v\n", err)
+	} else {
+		fmt.Printf("   ✅ GetCapabilities successful\n")
+		
+		// Read capabilities response
+		bodyBytes, err := io.ReadAll(response.Body)
+		if err == nil {
+			response.Body.Close()
+			responseStr := string(bodyBytes)
+			
+			fmt.Printf("   📋 Available services:\n")
+			if strings.Contains(responseStr, "Device") {
+				fmt.Printf("     • Device Service\n")
+			}
+			if strings.Contains(responseStr, "Media") {
+				fmt.Printf("     • Media Service\n")
+			}
+			if strings.Contains(responseStr, "Events") {
+				fmt.Printf("     • Events Service\n")
+			}
+			if strings.Contains(responseStr, "PTZ") {
+				fmt.Printf("     • PTZ Service\n")
+			}
+			if strings.Contains(responseStr, "Imaging") {
+				fmt.Printf("     • Imaging Service\n")
+			}
+			if strings.Contains(responseStr, "Analytics") {
+				fmt.Printf("     • Analytics Service\n")
+			}
+			
+			if verbose {
+				fmt.Printf("   Capabilities response preview: %s\n", responseStr[:min(500, len(responseStr))])
+			}
+		}
+	}
+
+	return nil
+}
+
+// extractXMLValue extracts a value from XML using simple string parsing
+func (c *CLI) extractXMLValue(xmlStr, tagName string) string {
+	// Try with namespace prefix first
+	prefixes := []string{"tds:", ""}
+	
+	for _, prefix := range prefixes {
+		startTag := fmt.Sprintf("<%s%s>", prefix, tagName)
+		endTag := fmt.Sprintf("</%s%s>", prefix, tagName)
+		
+		startIdx := strings.Index(xmlStr, startTag)
+		if startIdx == -1 {
+			continue
+		}
+		startIdx += len(startTag)
+		
+		endIdx := strings.Index(xmlStr[startIdx:], endTag)
+		if endIdx == -1 {
+			continue
+		}
+		
+		value := strings.TrimSpace(xmlStr[startIdx : startIdx+endIdx])
+		if value != "" {
+			return value
+		}
+	}
+	
+	return ""
+}
+
+// min returns the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // Version information (can be set via build flags)

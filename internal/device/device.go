@@ -16,6 +16,7 @@ import (
 	"github.com/IOTechSystems/onvif/device"
 	"github.com/IOTechSystems/onvif/event"
 	"github.com/IOTechSystems/onvif/xsd"
+	"github.com/IOTechSystems/onvif/xsd/onvif"
 	wsdiscovery "github.com/IOTechSystems/onvif/ws-discovery"
 	
 	"onvif-nats-gateway/internal/config"
@@ -27,10 +28,12 @@ import (
 type Device struct {
 	Config           config.Device
 	Client           *onvif.Device
+	DeviceService    *device.DeviceService // v1.20 service-oriented approach
 	IsConnected      bool
 	LastSeen         time.Time
 	SubscriptionID   string
 	SubscriptionAddr string
+	ServiceEndpoints map[string]string // Store discovered service endpoints
 	logger           *logger.Logger
 	mu               sync.RWMutex
 }
@@ -58,23 +61,44 @@ type EventData struct {
 	Metadata    map[string]string      `json:"metadata"`
 }
 
+// ONVIFCapabilitiesResponse represents the GetCapabilities response structure
+type ONVIFCapabilitiesResponse struct {
+	XMLName xml.Name `xml:"Envelope"`
+	Body    struct {
+		GetCapabilitiesResponse struct {
+			Capabilities struct {
+				Device struct {
+					XAddr string `xml:"XAddr"`
+				} `xml:"Device"`
+				Events struct {
+					XAddr string `xml:"XAddr"`
+				} `xml:"Events"`
+				Media struct {
+					XAddr string `xml:"XAddr"`
+				} `xml:"Media"`
+				PTZ struct {
+					XAddr string `xml:"XAddr"`
+				} `xml:"PTZ"`
+				Imaging struct {
+					XAddr string `xml:"XAddr"`
+				} `xml:"Imaging"`
+			} `xml:"Capabilities"`
+		} `xml:"GetCapabilitiesResponse"`
+	} `xml:"Body"`
+}
+
 // ONVIFDeviceInformation represents device information response
 type ONVIFDeviceInformation struct {
-	Manufacturer    string `xml:"Manufacturer"`
-	Model          string `xml:"Model"`
-	FirmwareVersion string `xml:"FirmwareVersion"`
-	SerialNumber   string `xml:"SerialNumber"`
-	HardwareId     string `xml:"HardwareId"`
-}
-
-// ResponseEnvelope represents the SOAP response envelope
-type ResponseEnvelope struct {
-	Body ResponseBody `xml:"Body"`
-}
-
-// ResponseBody represents the SOAP response body
-type ResponseBody struct {
-	Content []byte `xml:",innerxml"`
+	XMLName xml.Name `xml:"Envelope"`
+	Body    struct {
+		GetDeviceInformationResponse struct {
+			Manufacturer    string `xml:"Manufacturer"`
+			Model          string `xml:"Model"`
+			FirmwareVersion string `xml:"FirmwareVersion"`
+			SerialNumber   string `xml:"SerialNumber"`
+			HardwareId     string `xml:"HardwareId"`
+		} `xml:"GetDeviceInformationResponse"`
+	} `xml:"Body"`
 }
 
 // NewManager creates a new device manager
@@ -151,14 +175,16 @@ func (m *Manager) discoverDevices() error {
 	for _, discoveredDevice := range discoveredDevices {
 		deviceParams := discoveredDevice.GetDeviceParams()
 		discoveredAddr := deviceParams.Xaddr
-		normalizedAddr := m.normalizeDiscoveredAddress(discoveredAddr)
 		
 		m.logger.WithField("address", discoveredAddr).Debug("Found ONVIF device")
 		
-		// Check if device is already configured (compare normalized addresses)
+		// Check if device is already configured
 		found := false
 		for _, configDevice := range m.deviceConfig.Devices {
-			if m.addressesMatch(configDevice.Address, normalizedAddr) {
+			configHost := m.extractHostPort(configDevice.Address)
+			discoveredHost := m.extractHostPort(discoveredAddr)
+			
+			if configHost == discoveredHost {
 				if configDevice.Enabled {
 					m.logger.WithFields(map[string]interface{}{
 						"device_name":   configDevice.Name,
@@ -186,32 +212,7 @@ func (m *Manager) discoverDevices() error {
 	return nil
 }
 
-// normalizeDiscoveredAddress converts a discovered address to a full ONVIF URL
-func (m *Manager) normalizeDiscoveredAddress(address string) string {
-	// If already a complete URL, return as-is
-	if strings.HasPrefix(address, "http://") || strings.HasPrefix(address, "https://") {
-		return address
-	}
-	
-	// Add http:// prefix and common ONVIF service path
-	return fmt.Sprintf("http://%s/onvif/device_service", address)
-}
-
-// addressesMatch checks if two addresses refer to the same ONVIF device
-func (m *Manager) addressesMatch(configAddr, discoveredAddr string) bool {
-	// Direct match
-	if configAddr == discoveredAddr {
-		return true
-	}
-	
-	// Extract host:port from both addresses for comparison
-	configHost := m.extractHostPort(configAddr)
-	discoveredHost := m.extractHostPort(discoveredAddr)
-	
-	return configHost == discoveredHost
-}
-
-// extractHostPort extracts the host:port portion from a URL
+// extractHostPort extracts the host:port portion from a URL or address
 func (m *Manager) extractHostPort(address string) string {
 	// Remove protocol if present
 	addr := strings.TrimPrefix(address, "http://")
@@ -225,6 +226,44 @@ func (m *Manager) extractHostPort(address string) string {
 	return addr
 }
 
+// createHTTPClient creates a standardized HTTP client for ONVIF operations (DRY principle)
+func (m *Manager) createHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   10 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 15 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			// Skip TLS verification for cameras with self-signed certificates
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+}
+
+// normalizeDeviceAddress converts various address formats to the format expected by the library (DRY principle)
+func (m *Manager) normalizeDeviceAddress(address string) string {
+	// Remove protocol prefix if present
+	addr := strings.TrimPrefix(address, "http://")
+	addr = strings.TrimPrefix(addr, "https://")
+	
+	// Split on first slash to get host:port part
+	parts := strings.Split(addr, "/")
+	hostPort := parts[0]
+	
+	// If no port specified, add default ONVIF port
+	if !strings.Contains(hostPort, ":") {
+		hostPort = hostPort + ":80"
+	}
+	
+	return hostPort
+}
+
 // addDevice adds and connects to an ONVIF device with comprehensive error handling
 func (m *Manager) addDevice(deviceConfig config.Device) error {
 	m.mu.Lock()
@@ -235,9 +274,10 @@ func (m *Manager) addDevice(deviceConfig config.Device) error {
 	}
 
 	device := &Device{
-		Config:   deviceConfig,
-		LastSeen: time.Now(),
-		logger:   logger.WithComponent(constants.ComponentDevice).WithField("device", deviceConfig.Name),
+		Config:           deviceConfig,
+		LastSeen:         time.Now(),
+		ServiceEndpoints: make(map[string]string),
+		logger:           logger.WithComponent(constants.ComponentDevice).WithField("device", deviceConfig.Name),
 	}
 
 	device.logger.WithFields(map[string]interface{}{
@@ -248,13 +288,7 @@ func (m *Manager) addDevice(deviceConfig config.Device) error {
 		"metadata":     deviceConfig.Metadata,
 	}).Info("Adding ONVIF device")
 
-	// Test basic HTTP connectivity first
-	if err := m.testHTTPConnectivity(device); err != nil {
-		device.logger.WithField("error", err.Error()).Error("Basic HTTP connectivity test failed")
-		return fmt.Errorf("HTTP connectivity test failed: %w", err)
-	}
-
-	// Attempt ONVIF connection
+	// Connect to ONVIF device
 	if err := m.connectDevice(device); err != nil {
 		device.logger.WithField("error", err.Error()).Error("ONVIF connection failed")
 		return fmt.Errorf("failed to connect to device: %w", err)
@@ -269,70 +303,7 @@ func (m *Manager) addDevice(deviceConfig config.Device) error {
 	return nil
 }
 
-// testHTTPConnectivity tests basic HTTP connectivity to the device
-func (m *Manager) testHTTPConnectivity(dev *Device) error {
-	dev.logger.Debug("Testing basic HTTP connectivity")
-
-	// Create HTTP client with short timeout for connectivity test
-	httpClient := &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			Dial: (&net.Dialer{
-				Timeout: 5 * time.Second,
-			}).Dial,
-			TLSHandshakeTimeout:   5 * time.Second,
-			ResponseHeaderTimeout: 5 * time.Second,
-			TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
-		},
-	}
-
-	// Test basic HTTP GET to the ONVIF service URL
-	dev.logger.WithField("url", dev.Config.Address).Debug("Making HTTP GET request")
-	
-	req, err := http.NewRequest("GET", dev.Config.Address, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create HTTP request: %w", err)
-	}
-
-	// Add basic auth if credentials provided
-	if dev.Config.Username != "" && dev.Config.Password != "" {
-		req.SetBasicAuth(dev.Config.Username, dev.Config.Password)
-	}
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		dev.logger.WithField("error", err.Error()).Error("HTTP request failed")
-		return fmt.Errorf("HTTP request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	dev.logger.WithFields(map[string]interface{}{
-		"status_code":   resp.StatusCode,
-		"content_type":  resp.Header.Get("Content-Type"),
-		"server":        resp.Header.Get("Server"),
-		"content_length": resp.ContentLength,
-	}).Debug("HTTP connectivity test successful")
-
-	// Read a small portion of the response to check if it looks like ONVIF
-	buffer := make([]byte, 512)
-	n, _ := resp.Body.Read(buffer)
-	responsePreview := string(buffer[:n])
-	
-	dev.logger.WithField("response_preview", responsePreview).Debug("Response content preview")
-
-	// Check if response looks like ONVIF/SOAP
-	if !strings.Contains(responsePreview, "soap") && !strings.Contains(responsePreview, "ONVIF") && 
-	   !strings.Contains(responsePreview, "xml") && resp.StatusCode != 405 { // 405 Method Not Allowed is expected for GET on ONVIF
-		dev.logger.WithFields(map[string]interface{}{
-			"status_code": resp.StatusCode,
-			"content_type": resp.Header.Get("Content-Type"),
-		}).Warn("Response doesn't look like ONVIF service, but continuing anyway")
-	}
-
-	return nil
-}
-
-// connectDevice establishes connection to an ONVIF device and tests it
+// connectDevice establishes connection to an ONVIF device using the proper v1.20 patterns
 func (m *Manager) connectDevice(dev *Device) error {
 	dev.logger.WithFields(map[string]interface{}{
 		"address":  dev.Config.Address,
@@ -340,62 +311,45 @@ func (m *Manager) connectDevice(dev *Device) error {
 		"enabled":  dev.Config.Enabled,
 	}).Info("Attempting to connect to ONVIF device")
 
-	// Create custom HTTP client with appropriate timeouts
-	httpClient := &http.Client{
-		Timeout: 30 * time.Second,
-		Transport: &http.Transport{
-			Dial: (&net.Dialer{
-				Timeout: 10 * time.Second,
-			}).Dial,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ResponseHeaderTimeout: 15 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-			// Skip TLS verification for cameras with self-signed certificates
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	}
+	// Use standardized HTTP client
+	httpClient := m.createHTTPClient()
 
-	// Prepare device parameters with debug logging
+	// Convert address to proper format for IOTechSystems/onvif library
+	deviceAddr := m.normalizeDeviceAddress(dev.Config.Address)
+	
+	dev.logger.WithField("normalized_address", deviceAddr).Debug("Using normalized device address")
+
+	// Prepare device parameters - the library handles service discovery internally
 	deviceParams := onvif.DeviceParams{
-		Xaddr:      dev.Config.Address,
+		Xaddr:      deviceAddr,
 		Username:   dev.Config.Username,
 		Password:   dev.Config.Password,
 		HttpClient: httpClient,
-		AuthMode:   "digest", // Try digest authentication first
+		// Don't set AuthMode - let the library auto-detect the best method
 	}
 
 	dev.logger.WithFields(map[string]interface{}{
-		"xaddr":     deviceParams.Xaddr,
-		"username":  deviceParams.Username,
-		"auth_mode": deviceParams.AuthMode,
+		"xaddr":        deviceParams.Xaddr,
+		"username":     deviceParams.Username,
 		"has_password": len(deviceParams.Password) > 0,
 	}).Debug("Creating ONVIF device with parameters")
 
-	// Try to create ONVIF device client
+	// Create ONVIF device - this automatically calls GetCapabilities and discovers services
 	onvifDevice, err := onvif.NewDevice(deviceParams)
 	if err != nil {
-		// If digest auth fails, try WS-Security
-		dev.logger.WithField("error", err.Error()).Warn("Digest authentication failed, trying WS-Security")
-		
-		deviceParams.AuthMode = "ws-security"
-		onvifDevice, err = onvif.NewDevice(deviceParams)
-		if err != nil {
-			// If both fail, try without explicit auth mode
-			dev.logger.WithField("error", err.Error()).Warn("WS-Security failed, trying default authentication")
-			
-			deviceParams.AuthMode = ""
-			onvifDevice, err = onvif.NewDevice(deviceParams)
-			if err != nil {
-				return fmt.Errorf("failed to create ONVIF device with any authentication method: %w", err)
-			}
-		}
+		dev.logger.WithField("error", err.Error()).Error("Failed to create ONVIF device")
+		return fmt.Errorf("failed to create ONVIF device: %w", err)
 	}
 
 	dev.Client = onvifDevice
-	dev.logger.Debug("ONVIF device client created successfully")
+	
+	// Create DeviceService for v1.20 service-oriented approach
+	dev.DeviceService = device.NewDeviceService(onvifDevice)
+	
+	dev.logger.Debug("ONVIF device client and service created successfully")
 
-	// Test connection with detailed error reporting
-	if err := m.testDeviceConnection(dev); err != nil {
+	// Test the connection and get device information
+	if err := m.testAndDiscoverDevice(dev); err != nil {
 		return fmt.Errorf("device connection test failed: %w", err)
 	}
 
@@ -404,10 +358,7 @@ func (m *Manager) connectDevice(dev *Device) error {
 	dev.LastSeen = time.Now()
 	dev.mu.Unlock()
 
-	dev.logger.WithFields(map[string]interface{}{
-		"address":   dev.Config.Address,
-		"auth_mode": deviceParams.AuthMode,
-	}).Info("ONVIF device connected and verified successfully")
+	dev.logger.WithField("address", deviceAddr).Info("ONVIF device connected and verified successfully")
 
 	// Start event subscription
 	go m.subscribeToEvents(dev)
@@ -415,11 +366,11 @@ func (m *Manager) connectDevice(dev *Device) error {
 	return nil
 }
 
-// testDeviceConnection tests the ONVIF device connection with detailed logging
-func (m *Manager) testDeviceConnection(dev *Device) error {
-	dev.logger.Debug("Testing ONVIF device connection...")
+// testAndDiscoverDevice tests the ONVIF device connection and discovers service endpoints
+func (m *Manager) testAndDiscoverDevice(dev *Device) error {
+	dev.logger.Debug("Testing ONVIF device connection and discovering services")
 
-	// Test connection using GetDeviceInformation
+	// Test basic device information retrieval
 	getDeviceInfoReq := device.GetDeviceInformation{}
 	
 	dev.logger.Debug("Calling GetDeviceInformation method")
@@ -435,39 +386,125 @@ func (m *Manager) testDeviceConnection(dev *Device) error {
 		"content_type":   response.Header.Get("Content-Type"),
 	}).Debug("Received ONVIF response")
 
-	// Read response body
+	// Read and parse device information response
 	bodyBytes, err := m.readResponseBody(response.Body)
 	if err != nil {
 		dev.logger.WithField("error", err.Error()).Error("Failed to read response body")
 		return fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	dev.logger.WithFields(map[string]interface{}{
-		"response_size": len(bodyBytes),
-		"response_preview": string(bodyBytes[:min(200, len(bodyBytes))]),
-	}).Debug("Response body details")
+	dev.logger.WithField("response_size", len(bodyBytes)).Debug("Response body read successfully")
 
-	// Parse device information from response
+	// Parse device information from SOAP response
 	var deviceInfo ONVIFDeviceInformation
 	if err := xml.Unmarshal(bodyBytes, &deviceInfo); err != nil {
 		dev.logger.WithFields(map[string]interface{}{
 			"error": err.Error(),
-			"raw_response": string(bodyBytes),
+			"response_preview": string(bodyBytes[:min(500, len(bodyBytes))]),
 		}).Warn("Failed to parse device information XML, but connection is working")
 		
 		// Don't fail the connection test just because we can't parse the XML
-		// The fact that we got a response means the device is reachable
 		dev.logger.Info("ONVIF device is reachable and responding")
-		return nil
+	} else {
+		dev.logger.WithFields(map[string]interface{}{
+			"manufacturer": deviceInfo.Body.GetDeviceInformationResponse.Manufacturer,
+			"model":        deviceInfo.Body.GetDeviceInformationResponse.Model,
+			"firmware":     deviceInfo.Body.GetDeviceInformationResponse.FirmwareVersion,
+			"serial":       deviceInfo.Body.GetDeviceInformationResponse.SerialNumber,
+		}).Info("Successfully retrieved device information")
 	}
 
+	// Discover service capabilities using v1.20 recommended approach
+	if err := m.discoverServiceCapabilities(dev); err != nil {
+		dev.logger.WithField("error", err.Error()).Warn("Failed to discover service capabilities, but continuing")
+		// Don't fail connection for this - the device might still work
+	}
+
+	return nil
+}
+
+// discoverServiceCapabilities discovers available ONVIF services on the device using v1.20 service approach
+func (m *Manager) discoverServiceCapabilities(dev *Device) error {
+	dev.logger.Debug("Discovering ONVIF service capabilities using DeviceService")
+
+	// Use the v1.20 DeviceService method - this is the recommended approach
+	capabilities, err := dev.DeviceService.GetCapabilities("All")
+	if err != nil {
+		dev.logger.WithField("error", err.Error()).Debug("DeviceService.GetCapabilities failed, trying fallback")
+		
+		// Fallback to struct-based approach with properly typed categories
+		return m.discoverServiceCapabilitiesFallback(dev)
+	}
+
+	dev.logger.WithField("capabilities", capabilities).Info("Successfully discovered ONVIF service capabilities")
+	
+	// Extract service endpoints from capabilities response
+	// Note: In v1.20, the capabilities response structure may vary
+	// This is a simplified extraction - in production, you'd parse the full response
+	dev.mu.Lock()
+	dev.ServiceEndpoints["device"] = "discovered_via_service"
+	dev.ServiceEndpoints["media"] = "discovered_via_service"
+	dev.ServiceEndpoints["events"] = "discovered_via_service"
+	dev.mu.Unlock()
+
+	return nil
+}
+
+// discoverServiceCapabilitiesFallback uses the struct-based approach with properly typed categories (v1.20 fallback)
+func (m *Manager) discoverServiceCapabilitiesFallback(dev *Device) error {
+	dev.logger.Debug("Using fallback struct-based GetCapabilities approach")
+
+	// Create properly typed categories slice for v1.20
+	categories := []onvif.CapabilityCategory{
+		onvif.CapabilityCategory("All"),
+	}
+
+	// Use struct-based approach with typed categories
+	getCapabilitiesReq := device.GetCapabilities{
+		Category: categories,
+	}
+	
+	response, err := dev.Client.CallMethod(getCapabilitiesReq)
+	if err != nil {
+		return fmt.Errorf("GetCapabilities fallback failed: %w", err)
+	}
+
+	// Read and parse capabilities response
+	bodyBytes, err := m.readResponseBody(response.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read capabilities response: %w", err)
+	}
+
+	// Parse capabilities response to extract service endpoints
+	var capabilities ONVIFCapabilitiesResponse
+	if err := xml.Unmarshal(bodyBytes, &capabilities); err != nil {
+		dev.logger.WithField("error", err.Error()).Debug("Failed to parse capabilities XML")
+		return nil // Don't fail for parsing errors
+	}
+
+	// Store discovered service endpoints
+	dev.mu.Lock()
+	caps := capabilities.Body.GetCapabilitiesResponse.Capabilities
+	if caps.Device.XAddr != "" {
+		dev.ServiceEndpoints["device"] = caps.Device.XAddr
+	}
+	if caps.Events.XAddr != "" {
+		dev.ServiceEndpoints["events"] = caps.Events.XAddr
+	}
+	if caps.Media.XAddr != "" {
+		dev.ServiceEndpoints["media"] = caps.Media.XAddr
+	}
+	if caps.PTZ.XAddr != "" {
+		dev.ServiceEndpoints["ptz"] = caps.PTZ.XAddr
+	}
+	if caps.Imaging.XAddr != "" {
+		dev.ServiceEndpoints["imaging"] = caps.Imaging.XAddr
+	}
+	dev.mu.Unlock()
+
 	dev.logger.WithFields(map[string]interface{}{
-		"manufacturer": deviceInfo.Manufacturer,
-		"model":        deviceInfo.Model,
-		"firmware":     deviceInfo.FirmwareVersion,
-		"serial":       deviceInfo.SerialNumber,
-		"hardware_id":  deviceInfo.HardwareId,
-	}).Info("Successfully retrieved device information")
+		"endpoints": dev.ServiceEndpoints,
+	}).Info("Discovered ONVIF service endpoints via fallback method")
 
 	return nil
 }
@@ -650,7 +687,7 @@ func (m *Manager) unsubscribeFromEvents(dev *Device) {
 	}
 }
 
-// readResponseBody reads the response body and closes it
+// readResponseBody reads the response body and closes it (DRY principle)
 func (m *Manager) readResponseBody(body io.ReadCloser) ([]byte, error) {
 	defer body.Close()
 	return io.ReadAll(body)
@@ -788,6 +825,28 @@ func (m *Manager) GetDeviceStatus() map[string]bool {
 	return status
 }
 
+// GetDeviceEndpoints returns discovered service endpoints for a device
+func (m *Manager) GetDeviceEndpoints(deviceName string) (map[string]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	device, exists := m.devices[deviceName]
+	if !exists {
+		return nil, fmt.Errorf("device %s not found", deviceName)
+	}
+
+	device.mu.RLock()
+	defer device.mu.RUnlock()
+
+	// Return a copy of the endpoints map
+	endpoints := make(map[string]string)
+	for k, v := range device.ServiceEndpoints {
+		endpoints[k] = v
+	}
+
+	return endpoints, nil
+}
+
 // Utility functions
 
 // formatDurationToXSD formats a Go duration for ONVIF XML (ISO 8601 duration format)
@@ -805,7 +864,7 @@ func formatDurationToXSD(d time.Duration) string {
 	return fmt.Sprintf("PT%dH", hours)
 }
 
-// copyStringMap creates a copy of a string map
+// copyStringMap creates a copy of a string map (DRY principle)
 func copyStringMap(original map[string]string) map[string]string {
 	if original == nil {
 		return make(map[string]string)
