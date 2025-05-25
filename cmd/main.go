@@ -196,6 +196,7 @@ func initializeLogger(appCfg *config.AppConfig) error {
 		Level:     appCfg.Logging.Level,
 		Format:    appCfg.Logging.Format,
 		Component: appCfg.Logging.Component,
+		LogFile:   appCfg.Logging.LogFile,
 	}
 
 	return logger.Initialize(loggerConfig)
@@ -308,6 +309,9 @@ func (app *Application) Stop() {
 	if app.natsClient != nil {
 		app.natsClient.Stop()
 	}
+
+	// Close log file
+	logger.Close()
 
 	if app.logger != nil {
 		app.logger.Info("Application stopped successfully")

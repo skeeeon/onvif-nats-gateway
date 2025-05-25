@@ -314,7 +314,8 @@ func (m *Manager) connectDevice(dev *Device) error {
 
 	dev.logger.WithField("address", deviceAddr).Info("ONVIF device connected and verified successfully")
 
-	// Start event subscription
+	// Start event subscription in a separate goroutine
+	// Don't fail device connection if event subscription fails
 	go m.subscribeToEvents(dev)
 
 	return nil
@@ -440,21 +441,60 @@ func (m *Manager) disconnectDevice(dev *Device) {
 func (m *Manager) subscribeToEvents(dev *Device) {
 	dev.logger.Info("Starting ONVIF event subscription")
 
-	for {
+	// Check if device supports events
+	dev.mu.RLock()
+	hasEventsSupport := dev.ServiceEndpoints["events"] == "available"
+	dev.mu.RUnlock()
+
+	if !hasEventsSupport {
+		dev.logger.Warn("Device may not support ONVIF events - continuing anyway")
+	}
+
+	// Retry logic for subscription failures
+	maxRetries := 3
+	retryDelay := constants.BaseRetryDelay
+
+	for retry := 0; retry < maxRetries; retry++ {
 		select {
 		case <-m.ctx.Done():
-			dev.logger.Info("Event subscription stopping")
+			dev.logger.Info("Event subscription stopping due to context cancellation")
 			return
 		default:
-			if err := m.handleEventSubscription(dev); err != nil {
-				dev.logger.WithField("error", err.Error()).Error("Event subscription error")
+			if retry > 0 {
+				dev.logger.WithFields(map[string]interface{}{
+					"retry":       retry,
+					"max_retries": maxRetries,
+					"delay":       retryDelay,
+				}).Info("Retrying event subscription")
+				
 				// Wait before retrying
 				select {
 				case <-m.ctx.Done():
 					return
-				case <-time.After(constants.BaseRetryDelay):
-					// Continue retry loop
+				case <-time.After(retryDelay):
+					retryDelay *= 2 // Exponential backoff
 				}
+			}
+
+			if err := m.handleEventSubscription(dev); err != nil {
+				dev.logger.WithFields(map[string]interface{}{
+					"error": err.Error(),
+					"retry": retry + 1,
+				}).Error("Event subscription failed")
+				
+				// If this is the last retry, log additional troubleshooting info
+				if retry == maxRetries-1 {
+					dev.logger.WithFields(map[string]interface{}{
+						"device_address":    dev.Config.Address,
+						"events_capability": hasEventsSupport,
+						"troubleshooting":   "Device may not support ONVIF events or PullPoint subscriptions",
+					}).Error("Event subscription failed after all retries - continuing without events")
+					return // Give up after max retries
+				}
+			} else {
+				// Success - exit retry loop
+				dev.logger.Info("Event subscription established successfully")
+				return
 			}
 		}
 	}
@@ -469,19 +509,62 @@ func (m *Manager) handleEventSubscription(dev *Device) error {
 	}
 	dev.mu.Unlock()
 
-	// Create PullPoint subscription with proper XSD types
-	durationStr := formatDurationToXSD(m.appConfig.ONVIF.SubscriptionRenew)
-	termTime := xsd.String(durationStr)
-	createSubscription := event.CreatePullPointSubscription{
-		InitialTerminationTime: &termTime,
+	dev.logger.Info("Creating ONVIF PullPoint subscription")
+
+	// Try multiple subscription approaches for camera compatibility
+	subscriptionMethods := []func(*Device) (*http.Response, error){
+		m.createPullPointSubscriptionWithTermTime,
+		m.createPullPointSubscriptionWithoutTermTime,
+		m.createBasicPullPointSubscription,
 	}
 
-	response, err := dev.Client.CallMethod(createSubscription)
-	if err != nil {
-		return fmt.Errorf("failed to create PullPoint subscription: %w", err)
+	var lastErr error
+	var response *http.Response
+
+	for i, method := range subscriptionMethods {
+		methodName := []string{"WithTermTime", "WithoutTermTime", "Basic"}[i]
+		dev.logger.WithField("method", methodName).Debug("Trying subscription method")
+
+		resp, err := method(dev)
+		if err != nil {
+			dev.logger.WithFields(map[string]interface{}{
+				"method": methodName,
+				"error":  err.Error(),
+			}).Debug("Subscription method failed")
+			lastErr = err
+			continue
+		}
+
+		// Check if we got a successful response
+		if resp.StatusCode < 400 {
+			dev.logger.WithField("method", methodName).Info("Subscription method succeeded")
+			response = resp
+			break
+		} else {
+			// Log the error response but continue trying other methods
+			bodyBytes, _ := m.readResponseBody(resp.Body)
+			responseStr := string(bodyBytes)
+			
+			// Extract SOAP fault for better error analysis
+			soapFault := m.extractSOAPFault(responseStr)
+			
+			dev.logger.WithFields(map[string]interface{}{
+				"method":           methodName,
+				"status_code":      resp.StatusCode,
+				"response_preview": responseStr[:min(300, len(responseStr))],
+				"full_response":    responseStr, // Show complete response for analysis
+				"soap_fault":       soapFault,
+			}).Debug("Subscription method returned error, trying next method")
+			
+			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, responseStr[:min(100, len(responseStr))])
+		}
 	}
 
-	// Read and parse subscription response
+	if response == nil || response.StatusCode >= 400 {
+		return fmt.Errorf("all subscription methods failed, last error: %w", lastErr)
+	}
+
+	// Read and parse successful subscription response
 	bodyBytes, err := m.readResponseBody(response.Body)
 	if err != nil {
 		return fmt.Errorf("failed to read subscription response: %w", err)
@@ -489,6 +572,7 @@ func (m *Manager) handleEventSubscription(dev *Device) error {
 
 	subscriptionAddr, err := m.parseSubscriptionResponse(bodyBytes)
 	if err != nil {
+		dev.logger.WithField("error", err.Error()).Error("Failed to parse subscription response")
 		return fmt.Errorf("failed to parse subscription response: %w", err)
 	}
 
@@ -497,7 +581,7 @@ func (m *Manager) handleEventSubscription(dev *Device) error {
 	dev.SubscriptionID = subscriptionAddr // Use address as ID for simplicity
 	dev.mu.Unlock()
 
-	dev.logger.WithField("subscription_addr", subscriptionAddr).Info("ONVIF event subscription created")
+	dev.logger.WithField("subscription_addr", subscriptionAddr).Info("ONVIF event subscription created successfully")
 
 	// Set up subscription renewal ticker
 	renewTicker := time.NewTicker(m.appConfig.ONVIF.SubscriptionRenew / 2) // Renew at half the termination time
@@ -507,6 +591,7 @@ func (m *Manager) handleEventSubscription(dev *Device) error {
 	for {
 		select {
 		case <-m.ctx.Done():
+			dev.logger.Debug("Event subscription context cancelled")
 			return nil
 		case <-renewTicker.C:
 			// Renew subscription
@@ -514,7 +599,7 @@ func (m *Manager) handleEventSubscription(dev *Device) error {
 				dev.logger.WithField("error", err.Error()).Error("Failed to renew subscription")
 				return err
 			}
-			dev.logger.Debug("ONVIF subscription renewed")
+			dev.logger.Debug("ONVIF subscription renewed successfully")
 		default:
 			// Pull events
 			if err := m.pullEvents(dev); err != nil {
@@ -532,6 +617,36 @@ func (m *Manager) handleEventSubscription(dev *Device) error {
 	}
 }
 
+// createPullPointSubscriptionWithTermTime creates subscription with termination time
+func (m *Manager) createPullPointSubscriptionWithTermTime(dev *Device) (*http.Response, error) {
+	durationStr := formatDurationToXSD(m.appConfig.ONVIF.SubscriptionRenew)
+	termTime := xsd.String(durationStr)
+	createSubscription := event.CreatePullPointSubscription{
+		InitialTerminationTime: &termTime,
+	}
+
+	dev.logger.WithField("termination_time", durationStr).Debug("Creating subscription with termination time")
+	return dev.Client.CallMethod(createSubscription)
+}
+
+// createPullPointSubscriptionWithoutTermTime creates subscription without termination time
+func (m *Manager) createPullPointSubscriptionWithoutTermTime(dev *Device) (*http.Response, error) {
+	createSubscription := event.CreatePullPointSubscription{
+		// No InitialTerminationTime
+	}
+
+	dev.logger.Debug("Creating subscription without termination time")
+	return dev.Client.CallMethod(createSubscription)
+}
+
+// createBasicPullPointSubscription creates most basic subscription
+func (m *Manager) createBasicPullPointSubscription(dev *Device) (*http.Response, error) {
+	createSubscription := event.CreatePullPointSubscription{}
+
+	dev.logger.Debug("Creating basic subscription")
+	return dev.Client.CallMethod(createSubscription)
+}
+
 // pullEvents pulls event messages from the ONVIF device
 func (m *Manager) pullEvents(dev *Device) error {
 	timeoutStr := formatDurationToXSD(m.appConfig.ONVIF.EventPullTimeout)
@@ -540,16 +655,30 @@ func (m *Manager) pullEvents(dev *Device) error {
 		Timeout:      xsd.Duration(timeoutStr),
 	}
 
+	dev.logger.WithFields(map[string]interface{}{
+		"message_limit": 100,
+		"timeout":       timeoutStr,
+	}).Debug("Pulling events from ONVIF device")
+
 	response, err := dev.Client.CallMethod(pullMessages)
 	if err != nil {
+		// Check if this is a subscription-related error
+		if strings.Contains(err.Error(), "subscription") || strings.Contains(err.Error(), "reference") {
+			dev.logger.WithField("error", err.Error()).Warn("Subscription may have expired, will retry")
+			return fmt.Errorf("subscription error - will recreate: %w", err)
+		}
 		return fmt.Errorf("PullMessages failed: %w", err)
 	}
+
+	dev.logger.WithField("status_code", response.StatusCode).Debug("Received pull response")
 
 	// Read and parse event notifications
 	bodyBytes, err := m.readResponseBody(response.Body)
 	if err != nil {
 		return fmt.Errorf("failed to read pull response: %w", err)
 	}
+
+	dev.logger.WithField("response_size", len(bodyBytes)).Debug("Read pull response body")
 
 	notifications, err := m.parseEventNotifications(bodyBytes)
 	if err != nil {
@@ -558,8 +687,10 @@ func (m *Manager) pullEvents(dev *Device) error {
 	}
 
 	if len(notifications) > 0 {
-		dev.logger.WithField("event_count", len(notifications)).Debug("Received ONVIF events")
+		dev.logger.WithField("event_count", len(notifications)).Info("Received ONVIF events")
 		m.processEvents(dev, notifications)
+	} else {
+		dev.logger.Debug("No events received in this pull")
 	}
 
 	return nil
@@ -596,6 +727,76 @@ func (m *Manager) readResponseBody(body io.ReadCloser) ([]byte, error) {
 	return io.ReadAll(body)
 }
 
+// extractSOAPFault extracts SOAP fault information from XML response
+func (m *Manager) extractSOAPFault(xmlStr string) string {
+	// Try to find SOAP fault information
+	faultPatterns := []struct {
+		start string
+		end   string
+		name  string
+	}{
+		{"<soap:Fault>", "</soap:Fault>", "SOAP Fault"},
+		{"<env:Fault>", "</env:Fault>", "Envelope Fault"},
+		{"<faultstring>", "</faultstring>", "Fault String"},
+		{"<faultcode>", "</faultcode>", "Fault Code"},
+		{"<ter:Text>", "</ter:Text>", "Error Text"},
+	}
+	
+	var faultInfo []string
+	for _, pattern := range faultPatterns {
+		startIdx := strings.Index(xmlStr, pattern.start)
+		if startIdx == -1 {
+			continue
+		}
+		startIdx += len(pattern.start)
+		
+		endIdx := strings.Index(xmlStr[startIdx:], pattern.end)
+		if endIdx == -1 {
+			continue
+		}
+		
+		value := strings.TrimSpace(xmlStr[startIdx : startIdx+endIdx])
+		if value != "" {
+			faultInfo = append(faultInfo, fmt.Sprintf("%s: %s", pattern.name, value))
+		}
+	}
+	
+	return strings.Join(faultInfo, "; ")
+}
+func (m *Manager) extractSubscriptionAddress(xmlStr string) string {
+	// Try to find Address element within SubscriptionReference
+	addressPatterns := []struct {
+		start string
+		end   string
+	}{
+		{"<wsa:Address>", "</wsa:Address>"},           // WS-Addressing
+		{"<Address>", "</Address>"},                   // Plain
+		{"<tev:Address>", "</tev:Address>"},          // ONVIF Events namespace
+		{">http://", "<"},                             // Any HTTP URL
+		{">https://", "<"},                            // Any HTTPS URL
+	}
+	
+	for _, pattern := range addressPatterns {
+		startIdx := strings.Index(xmlStr, pattern.start)
+		if startIdx == -1 {
+			continue
+		}
+		startIdx += len(pattern.start)
+		
+		endIdx := strings.Index(xmlStr[startIdx:], pattern.end)
+		if endIdx == -1 {
+			continue
+		}
+		
+		address := strings.TrimSpace(xmlStr[startIdx : startIdx+endIdx])
+		if address != "" && (strings.HasPrefix(address, "http://") || strings.HasPrefix(address, "https://")) {
+			return address
+		}
+	}
+	
+	return ""
+}
+
 // parseSubscriptionResponse parses the subscription response to extract the subscription address
 func (m *Manager) parseSubscriptionResponse(responseBody []byte) (string, error) {
 	// This is a simplified parser - in production, you'd want more robust XML parsing
@@ -613,23 +814,75 @@ func (m *Manager) parseSubscriptionResponse(responseBody []byte) (string, error)
 
 // parseEventNotifications parses event notifications from the response
 func (m *Manager) parseEventNotifications(responseBody []byte) ([]map[string]interface{}, error) {
-	// This is a simplified parser for demonstration
-	// In production, you'd implement proper ONVIF event XML parsing with structs
-	
 	var notifications []map[string]interface{}
 	responseStr := string(responseBody)
 	
-	// Look for notification messages in the response
-	if strings.Contains(responseStr, "NotificationMessage") {
-		// For demonstration, create sample notifications
-		// In production, parse the actual XML structure
+	// Log response for debugging
+	m.logger.WithField("response_preview", responseStr[:min(200, len(responseStr))]).
+		Debug("Parsing event notification response")
+
+	// Look for notification messages in the response with various patterns
+	notificationPatterns := []string{
+		"NotificationMessage",
+		"tev:NotificationMessage", 
+		":NotificationMessage",
+	}
+	
+	hasNotifications := false
+	for _, pattern := range notificationPatterns {
+		if strings.Contains(responseStr, pattern) {
+			hasNotifications = true
+			m.logger.WithField("found_pattern", pattern).Debug("Found notification message pattern")
+			break
+		}
+	}
+	
+	if !hasNotifications {
+		// This is normal - no events to report
+		m.logger.Debug("No notification messages found in response")
+		return notifications, nil
+	}
+
+	// Try to extract event information from common ONVIF event patterns
+	eventTopics := []string{
+		"tns1:VideoSource/MotionAlarm",
+		"tns1:AudioAnalytics/Audio/DetectedSound", 
+		"tns1:Device/Trigger/DigitalInput",
+		"tns1:VideoAnalytics/ObjectDetection",
+		"tns1:Device/HardwareFailure",
+		"tns1:VideoSource/GlobalSceneChange",
+	}
+	
+	for _, topic := range eventTopics {
+		if strings.Contains(responseStr, topic) {
+			notification := map[string]interface{}{
+				"Topic":     topic,
+				"Message":   fmt.Sprintf("Event detected: %s", topic),
+				"Timestamp": time.Now().Format(time.RFC3339),
+				"Source":    "ONVIF_Device",
+				"Raw":       responseStr[:min(500, len(responseStr))], // Include raw data for debugging
+			}
+			notifications = append(notifications, notification)
+			
+			m.logger.WithFields(map[string]interface{}{
+				"topic":     topic,
+				"timestamp": notification["Timestamp"],
+			}).Info("Parsed ONVIF event")
+		}
+	}
+	
+	// If we found notification patterns but no specific events, create a generic one
+	if len(notifications) == 0 && hasNotifications {
 		notification := map[string]interface{}{
-			"Topic":     "tns1:VideoSource/MotionAlarm",
-			"Message":   "Motion detected",
+			"Topic":     "tns1:Unknown/Event",
+			"Message":   "Generic ONVIF event detected",
 			"Timestamp": time.Now().Format(time.RFC3339),
-			"Source":    "VideoSource",
+			"Source":    "ONVIF_Device",
+			"Raw":       responseStr[:min(500, len(responseStr))],
 		}
 		notifications = append(notifications, notification)
+		
+		m.logger.Info("Parsed generic ONVIF event")
 	}
 	
 	return notifications, nil
@@ -765,6 +1018,14 @@ func formatDurationToXSD(d time.Duration) string {
 	}
 	hours := minutes / 60
 	return fmt.Sprintf("PT%dH", hours)
+}
+
+// min returns the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // copyStringMap creates a copy of a string map (DRY principle)

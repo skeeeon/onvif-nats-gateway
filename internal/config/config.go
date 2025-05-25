@@ -2,7 +2,9 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -67,6 +69,7 @@ type LoggingConfig struct {
 	Level     string `yaml:"level"`
 	Format    string `yaml:"format"`
 	Component string `yaml:"component"`
+	LogFile   string `yaml:"log_file,omitempty"` // Optional log file path
 }
 
 // DiscoveredDevice represents a device found during discovery
@@ -261,8 +264,9 @@ func ValidateDevice(device *Device, index int) error {
 		return fmt.Errorf("device[%d]: address is required", index)
 	}
 
-	if !strings.HasPrefix(device.Address, "http://") && !strings.HasPrefix(device.Address, "https://") {
-		return fmt.Errorf("device[%d]: address must be a valid HTTP/HTTPS URL (e.g., http://192.168.1.100:80/onvif/device_service), got: %s", index, device.Address)
+	// Validate address format - IOTechSystems/onvif library expects host:port format
+	if err := validateDeviceAddress(device.Address); err != nil {
+		return fmt.Errorf("device[%d]: %w", index, err)
 	}
 
 	if device.NATSTopic == "" {
@@ -281,6 +285,89 @@ func ValidateDevice(device *Device, index int) error {
 	}
 
 	return nil
+}
+
+// validateDeviceAddress validates the device address format
+// IOTechSystems/onvif library expects host:port format, not full URLs
+func validateDeviceAddress(address string) error {
+	// Check if it looks like a URL (legacy format that needs fixing)
+	if strings.HasPrefix(address, "http://") || strings.HasPrefix(address, "https://") {
+		return fmt.Errorf("address should be in host:port format (e.g., 192.168.1.100:80), not a URL. Use 'fix-config' command to convert URLs to the correct format")
+	}
+
+	// Validate host:port format
+	host, portStr, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("address must be in host:port format (e.g., 192.168.1.100:80 or camera.local:8080), got: %s", address)
+	}
+
+	// Validate host part (IP address or hostname)
+	if host == "" {
+		return fmt.Errorf("host part cannot be empty in address: %s", address)
+	}
+
+	// Try to parse as IP address
+	if ip := net.ParseIP(host); ip == nil {
+		// If not an IP, validate as hostname
+		if !isValidHostname(host) {
+			return fmt.Errorf("invalid hostname or IP address: %s", host)
+		}
+	}
+
+	// Validate port part
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return fmt.Errorf("invalid port number: %s", portStr)
+	}
+
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("port must be between 1 and 65535, got: %d", port)
+	}
+
+	return nil
+}
+
+// isValidHostname validates a hostname according to RFC standards
+func isValidHostname(hostname string) bool {
+	if len(hostname) == 0 || len(hostname) > 253 {
+		return false
+	}
+
+	// Hostname cannot start or end with a dot
+	if strings.HasPrefix(hostname, ".") || strings.HasSuffix(hostname, ".") {
+		return false
+	}
+
+	// Split into labels and validate each
+	labels := strings.Split(hostname, ".")
+	for _, label := range labels {
+		if !isValidHostnameLabel(label) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// isValidHostnameLabel validates a single hostname label
+func isValidHostnameLabel(label string) bool {
+	if len(label) == 0 || len(label) > 63 {
+		return false
+	}
+
+	// Label cannot start or end with hyphen
+	if strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+		return false
+	}
+
+	// Label can only contain alphanumeric characters and hyphens
+	for _, r := range label {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-') {
+			return false
+		}
+	}
+
+	return true
 }
 
 // Utility functions

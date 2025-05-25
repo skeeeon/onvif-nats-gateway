@@ -7,6 +7,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -67,6 +68,8 @@ type Logger struct {
 
 var (
 	globalLogger *Logger
+	logFile      *os.File
+	logMutex     sync.Mutex
 )
 
 // Config represents logger configuration
@@ -74,6 +77,7 @@ type Config struct {
 	Level     string `yaml:"level"`
 	Format    string `yaml:"format"`
 	Component string `yaml:"component"`
+	LogFile   string `yaml:"log_file,omitempty"` // Optional log file path
 }
 
 // Initialize initializes the global logger
@@ -86,6 +90,21 @@ func Initialize(cfg Config) error {
 	format, err := parseLogFormat(cfg.Format)
 	if err != nil {
 		return fmt.Errorf("invalid log format: %w", err)
+	}
+
+	// Close existing log file if open
+	if logFile != nil {
+		logFile.Close()
+		logFile = nil
+	}
+
+	// Open log file if specified
+	if cfg.LogFile != "" {
+		file, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			return fmt.Errorf("failed to open log file %s: %w", cfg.LogFile, err)
+		}
+		logFile = file
 	}
 
 	globalLogger = &Logger{
@@ -258,14 +277,19 @@ func (l *Logger) log(level LogLevel, message string) {
 	l.output(entry)
 }
 
-// output writes the log entry to stdout
+// output writes the log entry to console and file
 func (l *Logger) output(entry LogEntry) {
+	logMutex.Lock()
+	defer logMutex.Unlock()
+
+	var logMessage string
+
 	switch l.format {
 	case JSON:
 		if data, err := json.Marshal(entry); err == nil {
-			log.Println(string(data))
+			logMessage = string(data)
 		} else {
-			log.Printf("Failed to marshal log entry: %v", err)
+			logMessage = fmt.Sprintf(`{"error":"Failed to marshal log entry: %v"}`, err)
 		}
 	case TEXT:
 		var fieldsStr string
@@ -285,13 +309,35 @@ func (l *Logger) output(entry LogEntry) {
 			callerStr = fmt.Sprintf(" caller=%s", entry.Caller)
 		}
 
-		log.Printf("%s %s%s %s%s%s",
+		logMessage = fmt.Sprintf("%s %s%s %s%s%s",
 			entry.Timestamp,
 			entry.Level,
 			componentStr,
 			entry.Message,
 			fieldsStr,
 			callerStr)
+	}
+
+	// Output to console
+	log.Println(logMessage)
+
+	// Output to file if configured
+	if logFile != nil {
+		if _, err := fmt.Fprintln(logFile, logMessage); err != nil {
+			// If file write fails, only log to console (avoid infinite loop)
+			log.Printf("Failed to write to log file: %v", err)
+		}
+	}
+}
+
+// Close closes the log file if open
+func Close() {
+	logMutex.Lock()
+	defer logMutex.Unlock()
+	
+	if logFile != nil {
+		logFile.Close()
+		logFile = nil
 	}
 }
 
