@@ -3,7 +3,6 @@ package device
 import (
 	"context"
 	"crypto/tls"
-	"encoding/xml"
 	"fmt"
 	"io"
 	"net"
@@ -16,7 +15,7 @@ import (
 	"github.com/IOTechSystems/onvif/device"
 	"github.com/IOTechSystems/onvif/event"
 	"github.com/IOTechSystems/onvif/xsd"
-	"github.com/IOTechSystems/onvif/xsd/onvif"
+	onvifTypes "github.com/IOTechSystems/onvif/xsd/onvif" // Alias to avoid conflict
 	wsdiscovery "github.com/IOTechSystems/onvif/ws-discovery"
 	
 	"onvif-nats-gateway/internal/config"
@@ -28,7 +27,6 @@ import (
 type Device struct {
 	Config           config.Device
 	Client           *onvif.Device
-	DeviceService    *device.DeviceService // v1.20 service-oriented approach
 	IsConnected      bool
 	LastSeen         time.Time
 	SubscriptionID   string
@@ -59,46 +57,6 @@ type EventData struct {
 	Topic       string                 `json:"topic"`
 	Data        map[string]interface{} `json:"data"`
 	Metadata    map[string]string      `json:"metadata"`
-}
-
-// ONVIFCapabilitiesResponse represents the GetCapabilities response structure
-type ONVIFCapabilitiesResponse struct {
-	XMLName xml.Name `xml:"Envelope"`
-	Body    struct {
-		GetCapabilitiesResponse struct {
-			Capabilities struct {
-				Device struct {
-					XAddr string `xml:"XAddr"`
-				} `xml:"Device"`
-				Events struct {
-					XAddr string `xml:"XAddr"`
-				} `xml:"Events"`
-				Media struct {
-					XAddr string `xml:"XAddr"`
-				} `xml:"Media"`
-				PTZ struct {
-					XAddr string `xml:"XAddr"`
-				} `xml:"PTZ"`
-				Imaging struct {
-					XAddr string `xml:"XAddr"`
-				} `xml:"Imaging"`
-			} `xml:"Capabilities"`
-		} `xml:"GetCapabilitiesResponse"`
-	} `xml:"Body"`
-}
-
-// ONVIFDeviceInformation represents device information response
-type ONVIFDeviceInformation struct {
-	XMLName xml.Name `xml:"Envelope"`
-	Body    struct {
-		GetDeviceInformationResponse struct {
-			Manufacturer    string `xml:"Manufacturer"`
-			Model          string `xml:"Model"`
-			FirmwareVersion string `xml:"FirmwareVersion"`
-			SerialNumber   string `xml:"SerialNumber"`
-			HardwareId     string `xml:"HardwareId"`
-		} `xml:"GetDeviceInformationResponse"`
-	} `xml:"Body"`
 }
 
 // NewManager creates a new device manager
@@ -342,11 +300,7 @@ func (m *Manager) connectDevice(dev *Device) error {
 	}
 
 	dev.Client = onvifDevice
-	
-	// Create DeviceService for v1.20 service-oriented approach
-	dev.DeviceService = device.NewDeviceService(onvifDevice)
-	
-	dev.logger.Debug("ONVIF device client and service created successfully")
+	dev.logger.Debug("ONVIF device client created successfully")
 
 	// Test the connection and get device information
 	if err := m.testAndDiscoverDevice(dev); err != nil {
@@ -370,7 +324,7 @@ func (m *Manager) connectDevice(dev *Device) error {
 func (m *Manager) testAndDiscoverDevice(dev *Device) error {
 	dev.logger.Debug("Testing ONVIF device connection and discovering services")
 
-	// Test basic device information retrieval
+	// Test basic device information retrieval using CallMethod
 	getDeviceInfoReq := device.GetDeviceInformation{}
 	
 	dev.logger.Debug("Calling GetDeviceInformation method")
@@ -395,26 +349,10 @@ func (m *Manager) testAndDiscoverDevice(dev *Device) error {
 
 	dev.logger.WithField("response_size", len(bodyBytes)).Debug("Response body read successfully")
 
-	// Parse device information from SOAP response
-	var deviceInfo ONVIFDeviceInformation
-	if err := xml.Unmarshal(bodyBytes, &deviceInfo); err != nil {
-		dev.logger.WithFields(map[string]interface{}{
-			"error": err.Error(),
-			"response_preview": string(bodyBytes[:min(500, len(bodyBytes))]),
-		}).Warn("Failed to parse device information XML, but connection is working")
-		
-		// Don't fail the connection test just because we can't parse the XML
-		dev.logger.Info("ONVIF device is reachable and responding")
-	} else {
-		dev.logger.WithFields(map[string]interface{}{
-			"manufacturer": deviceInfo.Body.GetDeviceInformationResponse.Manufacturer,
-			"model":        deviceInfo.Body.GetDeviceInformationResponse.Model,
-			"firmware":     deviceInfo.Body.GetDeviceInformationResponse.FirmwareVersion,
-			"serial":       deviceInfo.Body.GetDeviceInformationResponse.SerialNumber,
-		}).Info("Successfully retrieved device information")
-	}
+	// For now, just log that we got a response - proper XML parsing can be added later
+	dev.logger.Info("ONVIF device is reachable and responding")
 
-	// Discover service capabilities using v1.20 recommended approach
+	// Discover service capabilities using v1.20 CallMethod approach
 	if err := m.discoverServiceCapabilities(dev); err != nil {
 		dev.logger.WithField("error", err.Error()).Warn("Failed to discover service capabilities, but continuing")
 		// Don't fail connection for this - the device might still work
@@ -423,98 +361,63 @@ func (m *Manager) testAndDiscoverDevice(dev *Device) error {
 	return nil
 }
 
-// discoverServiceCapabilities discovers available ONVIF services on the device using v1.20 service approach
+// discoverServiceCapabilities discovers available ONVIF services on the device using CallMethod
 func (m *Manager) discoverServiceCapabilities(dev *Device) error {
-	dev.logger.Debug("Discovering ONVIF service capabilities using DeviceService")
-
-	// Use the v1.20 DeviceService method - this is the recommended approach
-	capabilities, err := dev.DeviceService.GetCapabilities("All")
-	if err != nil {
-		dev.logger.WithField("error", err.Error()).Debug("DeviceService.GetCapabilities failed, trying fallback")
-		
-		// Fallback to struct-based approach with properly typed categories
-		return m.discoverServiceCapabilitiesFallback(dev)
-	}
-
-	dev.logger.WithField("capabilities", capabilities).Info("Successfully discovered ONVIF service capabilities")
-	
-	// Extract service endpoints from capabilities response
-	// Note: In v1.20, the capabilities response structure may vary
-	// This is a simplified extraction - in production, you'd parse the full response
-	dev.mu.Lock()
-	dev.ServiceEndpoints["device"] = "discovered_via_service"
-	dev.ServiceEndpoints["media"] = "discovered_via_service"
-	dev.ServiceEndpoints["events"] = "discovered_via_service"
-	dev.mu.Unlock()
-
-	return nil
-}
-
-// discoverServiceCapabilitiesFallback uses the struct-based approach with properly typed categories (v1.20 fallback)
-func (m *Manager) discoverServiceCapabilitiesFallback(dev *Device) error {
-	dev.logger.Debug("Using fallback struct-based GetCapabilities approach")
+	dev.logger.Debug("Discovering ONVIF service capabilities using CallMethod")
 
 	// Create properly typed categories slice for v1.20
-	categories := []onvif.CapabilityCategory{
-		onvif.CapabilityCategory("All"),
+	categories := []onvifTypes.CapabilityCategory{
+		onvifTypes.CapabilityCategory("All"),
 	}
 
-	// Use struct-based approach with typed categories
+	// Use CallMethod with properly typed GetCapabilities request
 	getCapabilitiesReq := device.GetCapabilities{
 		Category: categories,
 	}
 	
 	response, err := dev.Client.CallMethod(getCapabilitiesReq)
 	if err != nil {
-		return fmt.Errorf("GetCapabilities fallback failed: %w", err)
+		dev.logger.WithField("error", err.Error()).Debug("GetCapabilities failed")
+		return fmt.Errorf("GetCapabilities failed: %w", err)
 	}
 
-	// Read and parse capabilities response
+	// Read capabilities response
 	bodyBytes, err := m.readResponseBody(response.Body)
 	if err != nil {
 		return fmt.Errorf("failed to read capabilities response: %w", err)
 	}
 
-	// Parse capabilities response to extract service endpoints
-	var capabilities ONVIFCapabilitiesResponse
-	if err := xml.Unmarshal(bodyBytes, &capabilities); err != nil {
-		dev.logger.WithField("error", err.Error()).Debug("Failed to parse capabilities XML")
-		return nil // Don't fail for parsing errors
-	}
+	dev.logger.WithField("response_size", len(bodyBytes)).Debug("Received capabilities response")
 
-	// Store discovered service endpoints
+	// For simplified implementation, parse the response to detect available services
+	responseStr := string(bodyBytes)
+	
+	// Store discovered service endpoints based on response content
 	dev.mu.Lock()
-	caps := capabilities.Body.GetCapabilitiesResponse.Capabilities
-	if caps.Device.XAddr != "" {
-		dev.ServiceEndpoints["device"] = caps.Device.XAddr
+	dev.ServiceEndpoints["device"] = "available"
+	
+	if strings.Contains(responseStr, "Media") {
+		dev.ServiceEndpoints["media"] = "available"
 	}
-	if caps.Events.XAddr != "" {
-		dev.ServiceEndpoints["events"] = caps.Events.XAddr
+	if strings.Contains(responseStr, "Events") {
+		dev.ServiceEndpoints["events"] = "available"
 	}
-	if caps.Media.XAddr != "" {
-		dev.ServiceEndpoints["media"] = caps.Media.XAddr
+	if strings.Contains(responseStr, "PTZ") {
+		dev.ServiceEndpoints["ptz"] = "available"
 	}
-	if caps.PTZ.XAddr != "" {
-		dev.ServiceEndpoints["ptz"] = caps.PTZ.XAddr
+	if strings.Contains(responseStr, "Imaging") {
+		dev.ServiceEndpoints["imaging"] = "available"
 	}
-	if caps.Imaging.XAddr != "" {
-		dev.ServiceEndpoints["imaging"] = caps.Imaging.XAddr
+	if strings.Contains(responseStr, "Analytics") {
+		dev.ServiceEndpoints["analytics"] = "available"
 	}
 	dev.mu.Unlock()
 
 	dev.logger.WithFields(map[string]interface{}{
 		"endpoints": dev.ServiceEndpoints,
-	}).Info("Discovered ONVIF service endpoints via fallback method")
+	}).Info("Discovered ONVIF service capabilities")
 
 	return nil
-}
-
-// min returns the minimum of two integers
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 // disconnectDevice disconnects from an ONVIF device
@@ -695,7 +598,7 @@ func (m *Manager) readResponseBody(body io.ReadCloser) ([]byte, error) {
 
 // parseSubscriptionResponse parses the subscription response to extract the subscription address
 func (m *Manager) parseSubscriptionResponse(responseBody []byte) (string, error) {
-	// This is a simplified parser - in production you'd want more robust XML parsing
+	// This is a simplified parser - in production, you'd want more robust XML parsing
 	responseStr := string(responseBody)
 	
 	// Look for subscription reference address in the response

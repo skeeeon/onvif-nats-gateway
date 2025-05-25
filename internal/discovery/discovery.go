@@ -11,6 +11,7 @@ import (
 	"gopkg.in/yaml.v3"
 	"github.com/IOTechSystems/onvif"
 	"github.com/IOTechSystems/onvif/device"
+	onvifTypes "github.com/IOTechSystems/onvif/xsd/onvif"
 	wsdiscovery "github.com/IOTechSystems/onvif/ws-discovery"
 
 	"onvif-nats-gateway/internal/config"
@@ -240,8 +241,14 @@ func (s *Service) getDeviceCapabilities(deviceInfo *DeviceInfo, onvifDevice *onv
 	capabilities := []string{"device"}
 	
 	// Try to get more detailed capabilities (may fail without auth)
-	// Use string constant as shown in IOTechSystems/onvif documentation
-	getCapabilitiesReq := device.GetCapabilities{Category: "All"}
+	// Use proper v1.20 approach with typed categories
+	categories := []onvifTypes.CapabilityCategory{
+		onvifTypes.CapabilityCategory("All"),
+	}
+	
+	getCapabilitiesReq := device.GetCapabilities{
+		Category: categories,
+	}
 	
 	response, err := onvifDevice.CallMethod(getCapabilitiesReq)
 	if err != nil {

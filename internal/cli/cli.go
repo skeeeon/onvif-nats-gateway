@@ -13,6 +13,7 @@ import (
 
 	"github.com/IOTechSystems/onvif"
 	"github.com/IOTechSystems/onvif/device"
+	onvifTypes "github.com/IOTechSystems/onvif/xsd/onvif"
 	"onvif-nats-gateway/internal/config"
 	"onvif-nats-gateway/internal/constants"
 	"onvif-nats-gateway/internal/discovery"
@@ -948,9 +949,12 @@ func (c *CLI) testONVIFConnection(address, username, password string, verbose bo
 		}
 	}
 
-	// Test GetCapabilities
+	// Test GetCapabilities using v1.20 proper approach
 	fmt.Printf("   Testing GetCapabilities...\n")
-	getCapabilitiesReq := device.GetCapabilities{Category: "All"}
+	categories := []onvifTypes.CapabilityCategory{
+		onvifTypes.CapabilityCategory("All"),
+	}
+	getCapabilitiesReq := device.GetCapabilities{Category: categories}
 	response, err = onvifDevice.CallMethod(getCapabilitiesReq)
 	if err != nil {
 		fmt.Printf("   ⚠️  GetCapabilities failed: %v\n", err)
