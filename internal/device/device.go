@@ -875,7 +875,7 @@ func (m *Manager) parseSubscriptionResponseXML(response *http.Response) (string,
 	return "", fmt.Errorf("could not extract subscription address from response: %s", responseStr[:min(200, len(responseStr))])
 }
 
-// pullEvents pulls event messages from the ONVIF device using the subscription endpoint
+// pullEvents pulls event messages from the ONVIF device using the SIMPLIFIED APPROACH from library examples
 func (m *Manager) pullEvents(dev *Device) error {
 	dev.mu.RLock()
 	subscriptionAddr := dev.SubscriptionAddr
@@ -885,11 +885,11 @@ func (m *Manager) pullEvents(dev *Device) error {
 		return fmt.Errorf("no subscription address available")
 	}
 
-	// Create PullMessages request
+	// Create PullMessages request using the EXACT PATTERN from library examples
 	timeoutStr := formatDurationToXSD(m.appConfig.ONVIF.EventPullTimeout)
 	pullMessages := event.PullMessages{
-		MessageLimit: 100,
 		Timeout:      xsd.Duration(timeoutStr),
+		MessageLimit: 100,
 	}
 
 	dev.logger.WithFields(map[string]interface{}{
@@ -898,14 +898,14 @@ func (m *Manager) pullEvents(dev *Device) error {
 		"subscription_addr": subscriptionAddr,
 	}).Debug("Pulling events from ONVIF subscription endpoint")
 
-	// Create full SOAP envelope with WS-Addressing headers
-	soapEnvelope, err := m.createSOAPEnvelopeWithAddressing(pullMessages, subscriptionAddr, "http://docs.oasis-open.org/wsn/bw-2/PullMessages/PullMessagesRequest")
+	// SIMPLIFIED APPROACH: Use simple XML marshaling exactly like the library examples
+	requestBody, err := xml.Marshal(pullMessages)
 	if err != nil {
-		return fmt.Errorf("failed to create SOAP envelope: %w", err)
+		return fmt.Errorf("failed to marshal PullMessages request: %w", err)
 	}
 
-	// Use SendSoap with the complete SOAP envelope
-	response, err := dev.Client.SendSoap(subscriptionAddr, soapEnvelope)
+	// Use SendSoap with simple marshaled request - exactly like library examples
+	response, err := dev.Client.SendSoap(subscriptionAddr, string(requestBody))
 	if err != nil {
 		// Check if this is a subscription-related error
 		if strings.Contains(err.Error(), "subscription") || strings.Contains(err.Error(), "reference") {
@@ -946,39 +946,7 @@ func (m *Manager) pullEvents(dev *Device) error {
 	return nil
 }
 
-// createSOAPEnvelopeWithAddressing creates a complete SOAP envelope with WS-Addressing headers
-func (m *Manager) createSOAPEnvelopeWithAddressing(body interface{}, toAddress, action string) (string, error) {
-	// Generate unique message ID
-	messageID := fmt.Sprintf("uuid:%d", time.Now().UnixNano())
-	
-	// Marshal the body content
-	bodyXML, err := xml.Marshal(body)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal body: %w", err)
-	}
-
-	// Create complete SOAP envelope with WS-Addressing headers
-	soapEnvelope := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" 
-               xmlns:wsa="http://www.w3.org/2005/08/addressing"
-               xmlns:tev="http://www.onvif.org/ver10/events/wsdl">
-  <soap:Header>
-    <wsa:To>%s</wsa:To>
-    <wsa:Action>%s</wsa:Action>
-    <wsa:MessageID>%s</wsa:MessageID>
-    <wsa:ReplyTo>
-      <wsa:Address>http://www.w3.org/2005/08/addressing/anonymous</wsa:Address>
-    </wsa:ReplyTo>
-  </soap:Header>
-  <soap:Body>
-    %s
-  </soap:Body>
-</soap:Envelope>`, toAddress, action, messageID, string(bodyXML))
-
-	return soapEnvelope, nil
-}
-
-// renewSubscription renews the ONVIF event subscription using the subscription endpoint
+// renewSubscription renews the ONVIF event subscription using SIMPLIFIED APPROACH
 func (m *Manager) renewSubscription(dev *Device) error {
 	dev.mu.RLock()
 	subscriptionAddr := dev.SubscriptionAddr
@@ -993,14 +961,14 @@ func (m *Manager) renewSubscription(dev *Device) error {
 		TerminationTime: xsd.String(durationStr),
 	}
 
-	// Create full SOAP envelope with WS-Addressing headers
-	soapEnvelope, err := m.createSOAPEnvelopeWithAddressing(renewReq, subscriptionAddr, "http://docs.oasis-open.org/wsn/bw-2/Renew/RenewRequest")
+	// SIMPLIFIED APPROACH: Use simple XML marshaling exactly like library examples
+	requestBody, err := xml.Marshal(renewReq)
 	if err != nil {
-		return fmt.Errorf("failed to create renew SOAP envelope: %w", err)
+		return fmt.Errorf("failed to marshal Renew request: %w", err)
 	}
 
-	// Use SendSoap with the complete SOAP envelope
-	response, err := dev.Client.SendSoap(subscriptionAddr, soapEnvelope)
+	// Use SendSoap with simple marshaled request
+	response, err := dev.Client.SendSoap(subscriptionAddr, string(requestBody))
 	if err != nil {
 		return fmt.Errorf("renew request failed: %w", err)
 	}
@@ -1013,7 +981,7 @@ func (m *Manager) renewSubscription(dev *Device) error {
 	return nil
 }
 
-// unsubscribeFromEvents unsubscribes from ONVIF events using the subscription endpoint with proper SOAP envelope
+// unsubscribeFromEvents unsubscribes from ONVIF events using SIMPLIFIED APPROACH
 func (m *Manager) unsubscribeFromEvents(dev *Device) {
 	if dev.SubscriptionAddr == "" {
 		return
@@ -1021,15 +989,15 @@ func (m *Manager) unsubscribeFromEvents(dev *Device) {
 
 	unsubscribeReq := event.Unsubscribe{}
 	
-	// Create full SOAP envelope with WS-Addressing headers
-	soapEnvelope, err := m.createSOAPEnvelopeWithAddressing(unsubscribeReq, dev.SubscriptionAddr, "http://docs.oasis-open.org/wsn/bw-2/Unsubscribe/UnsubscribeRequest")
+	// SIMPLIFIED APPROACH: Use simple XML marshaling exactly like library examples
+	requestBody, err := xml.Marshal(unsubscribeReq)
 	if err != nil {
-		dev.logger.WithField("error", err.Error()).Warn("Failed to create unsubscribe SOAP envelope")
+		dev.logger.WithField("error", err.Error()).Warn("Failed to marshal Unsubscribe request")
 		return
 	}
 
-	// Use SendSoap with the complete SOAP envelope
-	response, err := dev.Client.SendSoap(dev.SubscriptionAddr, soapEnvelope)
+	// Use SendSoap with simple marshaled request
+	response, err := dev.Client.SendSoap(dev.SubscriptionAddr, string(requestBody))
 	if err != nil {
 		dev.logger.WithField("error", err.Error()).Warn("Failed to unsubscribe from events")
 		return
@@ -1046,8 +1014,6 @@ func (m *Manager) unsubscribeFromEvents(dev *Device) {
 
 	dev.logger.Debug("Successfully unsubscribed from ONVIF events")
 }
-
-
 
 // readResponseBody reads the response body and closes it (DRY principle)
 func (m *Manager) readResponseBody(body io.ReadCloser) ([]byte, error) {
