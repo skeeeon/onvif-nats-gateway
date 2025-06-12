@@ -3,6 +3,7 @@ package device
 import (
 	"context"
 	"crypto/tls"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net"
@@ -642,7 +643,7 @@ func (m *Manager) handleEventSubscription(dev *Device) error {
 			}
 			dev.logger.Debug("ONVIF subscription renewed successfully")
 		default:
-			// Pull events using CallMethod - this is the main fix
+			// Pull events using SendSoap with subscription endpoint - this is the main fix
 			if err := m.pullEvents(dev); err != nil {
 				dev.logger.WithField("error", err.Error()).Error("Failed to pull events")
 				return err
@@ -824,9 +825,17 @@ func (m *Manager) parseSubscriptionResponse(response *http.Response) (string, er
 	return "", fmt.Errorf("could not extract subscription address from response: %s", responseStr[:min(200, len(responseStr))])
 }
 
-// pullEvents pulls event messages from the ONVIF device using CallMethod - MAIN FIX
+// pullEvents pulls event messages from the ONVIF device using SendSoap with subscription endpoint - MAIN FIX
 func (m *Manager) pullEvents(dev *Device) error {
-	// Create PullMessages request using standard approach
+	dev.mu.RLock()
+	subscriptionAddr := dev.SubscriptionAddr
+	dev.mu.RUnlock()
+
+	if subscriptionAddr == "" {
+		return fmt.Errorf("no subscription address available")
+	}
+
+	// Create PullMessages request
 	timeoutStr := formatDurationToXSD(m.appConfig.ONVIF.EventPullTimeout)
 	pullMessages := event.PullMessages{
 		Timeout:      xsd.Duration(timeoutStr),
@@ -834,19 +843,26 @@ func (m *Manager) pullEvents(dev *Device) error {
 	}
 
 	dev.logger.WithFields(map[string]interface{}{
+		"subscription_addr": subscriptionAddr,
 		"message_limit": 100,
 		"timeout":       timeoutStr,
 	}).Debug("Pulling events from ONVIF subscription endpoint")
 
-	// MAIN FIX: Use CallMethod instead of SendSoap - this handles SOAP envelope and WS-Addressing headers automatically
-	response, err := dev.Client.CallMethod(pullMessages)
+	// Marshal the request to XML
+	requestBody, err := xml.Marshal(pullMessages)
+	if err != nil {
+		return fmt.Errorf("failed to marshal PullMessages request: %w", err)
+	}
+
+	// MAIN FIX: Use SendSoap with subscription endpoint instead of CallMethod
+	response, err := dev.Client.SendSoap(subscriptionAddr, string(requestBody))
 	if err != nil {
 		// Check if this is a subscription-related error
-		if strings.Contains(err.Error(), "subscription") || strings.Contains(err.Error(), "reference") {
-			dev.logger.WithField("error", err.Error()).Warn("Subscription may have expired, will retry")
+		if strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "MessageAddressingHeaderRequired") {
+			dev.logger.WithField("error", err.Error()).Warn("Subscription may have expired or requires re-authentication, will retry")
 			return fmt.Errorf("subscription error - will recreate: %w", err)
 		}
-		return fmt.Errorf("PullMessages failed: %w", err)
+		return fmt.Errorf("SendSoap failed: %w", err)
 	}
 
 	dev.logger.WithField("status_code", response.StatusCode).Debug("Received pull response")
@@ -880,15 +896,29 @@ func (m *Manager) pullEvents(dev *Device) error {
 	return nil
 }
 
-// renewSubscription renews the ONVIF event subscription using CallMethod - IMPROVED
+// renewSubscription renews the ONVIF event subscription using SendSoap - IMPROVED
 func (m *Manager) renewSubscription(dev *Device) error {
+	dev.mu.RLock()
+	subscriptionAddr := dev.SubscriptionAddr
+	dev.mu.RUnlock()
+
+	if subscriptionAddr == "" {
+		return fmt.Errorf("no subscription address available")
+	}
+
 	durationStr := formatDurationToXSD(m.appConfig.ONVIF.SubscriptionRenew)
 	renewReq := event.Renew{
 		TerminationTime: xsd.String(durationStr),
 	}
 
-	// IMPROVED: Use CallMethod instead of SendSoap - this handles SOAP envelope and authentication automatically
-	response, err := dev.Client.CallMethod(renewReq)
+	// Marshal the request to XML
+	requestBody, err := xml.Marshal(renewReq)
+	if err != nil {
+		return fmt.Errorf("failed to marshal Renew request: %w", err)
+	}
+
+	// IMPROVED: Use SendSoap with subscription endpoint instead of CallMethod
+	response, err := dev.Client.SendSoap(subscriptionAddr, string(requestBody))
 	if err != nil {
 		return fmt.Errorf("renew request failed: %w", err)
 	}
@@ -903,7 +933,7 @@ func (m *Manager) renewSubscription(dev *Device) error {
 	return nil
 }
 
-// unsubscribeFromEvents unsubscribes from ONVIF events using CallMethod - IMPROVED
+// unsubscribeFromEvents unsubscribes from ONVIF events using SendSoap - IMPROVED
 func (m *Manager) unsubscribeFromEvents(dev *Device) {
 	if dev.SubscriptionAddr == "" {
 		return
@@ -911,8 +941,15 @@ func (m *Manager) unsubscribeFromEvents(dev *Device) {
 
 	unsubscribeReq := event.Unsubscribe{}
 	
-	// IMPROVED: Use CallMethod instead of SendSoap - this handles SOAP envelope and authentication automatically
-	response, err := dev.Client.CallMethod(unsubscribeReq)
+	// Marshal the request to XML
+	requestBody, err := xml.Marshal(unsubscribeReq)
+	if err != nil {
+		dev.logger.WithField("error", err.Error()).Warn("Failed to marshal Unsubscribe request")
+		return
+	}
+
+	// IMPROVED: Use SendSoap with subscription endpoint instead of CallMethod
+	response, err := dev.Client.SendSoap(dev.SubscriptionAddr, string(requestBody))
 	if err != nil {
 		dev.logger.WithField("error", err.Error()).Warn("Failed to unsubscribe from events")
 		return
