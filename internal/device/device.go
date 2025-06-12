@@ -3,7 +3,6 @@ package device
 import (
 	"context"
 	"crypto/tls"
-	"encoding/xml"
 	"fmt"
 	"io"
 	"net"
@@ -30,7 +29,6 @@ type Device struct {
 	Client           *onvif.Device
 	IsConnected      bool
 	LastSeen         time.Time
-	SubscriptionID   string
 	SubscriptionAddr string
 	ServiceEndpoints map[string]string // Store discovered service endpoints
 	logger           *logger.Logger
@@ -58,18 +56,6 @@ type EventData struct {
 	Topic       string                 `json:"topic"`
 	Data        map[string]interface{} `json:"data"`
 	Metadata    map[string]string      `json:"metadata"`
-}
-
-// SubscriptionReference represents the ONVIF subscription reference structure
-type SubscriptionReference struct {
-	Address string `xml:"Address"`
-}
-
-// CreatePullPointSubscriptionResponse represents the subscription creation response
-type CreatePullPointSubscriptionResponse struct {
-	SubscriptionReference SubscriptionReference `xml:"SubscriptionReference"`
-	CurrentTime           string                `xml:"CurrentTime"`
-	TerminationTime       string                `xml:"TerminationTime"`
 }
 
 // NewManager creates a new device manager
@@ -310,7 +296,7 @@ func (m *Manager) connectDevice(dev *Device) error {
 			dev.logger.WithFields(map[string]interface{}{
 				"auth_method": authMethod,
 				"error": err.Error(),
-			}).Debug("Authentication method failed")
+			}).Debug("Device access test failed")
 			lastErr = err
 			continue
 		}
@@ -510,14 +496,13 @@ func (m *Manager) disconnectDevice(dev *Device) {
 	if dev.SubscriptionAddr != "" {
 		m.unsubscribeFromEvents(dev)
 		dev.SubscriptionAddr = ""
-		dev.SubscriptionID = ""
 	}
 
 	dev.IsConnected = false
 	dev.logger.Info("ONVIF device disconnected")
 }
 
-// subscribeToEvents subscribes to events from an ONVIF device using PullPoint
+// subscribeToEvents subscribes to events from an ONVIF device using improved CallMethod approach
 func (m *Manager) subscribeToEvents(dev *Device) {
 	dev.logger.Info("Starting ONVIF event subscription")
 
@@ -616,7 +601,7 @@ func (m *Manager) logEventSubscriptionTroubleshooting(dev *Device, lastErr error
 	dev.logger.WithFields(troubleshootingInfo).Error("Event subscription failed after all retries - comprehensive troubleshooting info")
 }
 
-// handleEventSubscription manages the ONVIF event subscription lifecycle
+// handleEventSubscription manages the ONVIF event subscription lifecycle using CallMethod
 func (m *Manager) handleEventSubscription(dev *Device) error {
 	dev.mu.Lock()
 	if !dev.IsConnected {
@@ -627,13 +612,7 @@ func (m *Manager) handleEventSubscription(dev *Device) error {
 
 	dev.logger.Info("Creating ONVIF PullPoint subscription")
 
-	// Test event service accessibility first
-	if err := m.testEventServiceAccess(dev); err != nil {
-		dev.logger.WithField("error", err.Error()).Error("Event service access test failed")
-		return fmt.Errorf("event service not accessible: %w", err)
-	}
-
-	// Create PullPoint subscription using the device endpoint
+	// Create PullPoint subscription using CallMethod - this is the key fix
 	subscriptionAddr, err := m.createPullPointSubscription(dev)
 	if err != nil {
 		return fmt.Errorf("failed to create PullPoint subscription: %w", err)
@@ -641,7 +620,6 @@ func (m *Manager) handleEventSubscription(dev *Device) error {
 
 	dev.mu.Lock()
 	dev.SubscriptionAddr = subscriptionAddr
-	dev.SubscriptionID = subscriptionAddr // Use address as ID for simplicity
 	dev.mu.Unlock()
 
 	dev.logger.WithField("subscription_addr", subscriptionAddr).Info("ONVIF event subscription created successfully")
@@ -664,7 +642,7 @@ func (m *Manager) handleEventSubscription(dev *Device) error {
 			}
 			dev.logger.Debug("ONVIF subscription renewed successfully")
 		default:
-			// Pull events
+			// Pull events using CallMethod - this is the main fix
 			if err := m.pullEvents(dev); err != nil {
 				dev.logger.WithField("error", err.Error()).Error("Failed to pull events")
 				return err
@@ -680,39 +658,7 @@ func (m *Manager) handleEventSubscription(dev *Device) error {
 	}
 }
 
-// testEventServiceAccess tests if we can access the event service with current credentials
-func (m *Manager) testEventServiceAccess(dev *Device) error {
-	dev.logger.Debug("Testing event service access")
-	
-	// Try to get event properties - this requires event service access
-	getEventProps := event.GetEventProperties{}
-	
-	response, err := dev.Client.CallMethod(getEventProps)
-	if err != nil {
-		dev.logger.WithField("error", err.Error()).Debug("GetEventProperties failed")
-		return fmt.Errorf("GetEventProperties failed: %w", err)
-	}
-	
-	if response.StatusCode >= 400 {
-		bodyBytes, _ := m.readResponseBody(response.Body)
-		dev.logger.WithFields(map[string]interface{}{
-			"status_code": response.StatusCode,
-			"response": string(bodyBytes[:min(200, len(bodyBytes))]),
-		}).Debug("GetEventProperties returned error status")
-		return fmt.Errorf("GetEventProperties returned HTTP %d", response.StatusCode)
-	}
-	
-	// Read and log the response
-	bodyBytes, err := m.readResponseBody(response.Body)
-	if err != nil {
-		return fmt.Errorf("failed to read event properties response: %w", err)
-	}
-	
-	dev.logger.WithField("response_size", len(bodyBytes)).Debug("Event service access test successful")
-	return nil
-}
-
-// createPullPointSubscription creates a PullPoint subscription and returns the subscription endpoint
+// createPullPointSubscription creates a PullPoint subscription using CallMethod approach
 func (m *Manager) createPullPointSubscription(dev *Device) (string, error) {
 	// Try multiple subscription approaches for camera compatibility
 	subscriptionMethods := []func(*Device) (string, error){
@@ -746,7 +692,7 @@ func (m *Manager) createPullPointSubscription(dev *Device) (string, error) {
 	return "", fmt.Errorf("all subscription methods failed, last error: %w", lastErr)
 }
 
-// createSubscriptionWithTermTime creates subscription with termination time
+// createSubscriptionWithTermTime creates subscription with termination time using CallMethod
 func (m *Manager) createSubscriptionWithTermTime(dev *Device) (string, error) {
 	// Log credentials being used for debugging
 	dev.logger.WithFields(map[string]interface{}{
@@ -763,15 +709,16 @@ func (m *Manager) createSubscriptionWithTermTime(dev *Device) (string, error) {
 
 	dev.logger.WithField("termination_time", durationStr).Debug("Creating subscription with termination time")
 	
+	// Use CallMethod - this handles SOAP envelope and authentication automatically
 	response, err := dev.Client.CallMethod(createSubscription)
 	if err != nil {
 		return "", err
 	}
 
-	return m.parseSubscriptionResponseXML(response)
+	return m.parseSubscriptionResponse(response)
 }
 
-// createSubscriptionWithoutTermTime creates subscription without termination time
+// createSubscriptionWithoutTermTime creates subscription without termination time using CallMethod
 func (m *Manager) createSubscriptionWithoutTermTime(dev *Device) (string, error) {
 	createSubscription := event.CreatePullPointSubscription{
 		// No InitialTerminationTime
@@ -779,30 +726,32 @@ func (m *Manager) createSubscriptionWithoutTermTime(dev *Device) (string, error)
 
 	dev.logger.Debug("Creating subscription without termination time")
 	
+	// Use CallMethod - this handles SOAP envelope and authentication automatically
 	response, err := dev.Client.CallMethod(createSubscription)
 	if err != nil {
 		return "", err
 	}
 
-	return m.parseSubscriptionResponseXML(response)
+	return m.parseSubscriptionResponse(response)
 }
 
-// createBasicSubscription creates most basic subscription
+// createBasicSubscription creates most basic subscription using CallMethod
 func (m *Manager) createBasicSubscription(dev *Device) (string, error) {
 	createSubscription := event.CreatePullPointSubscription{}
 
 	dev.logger.Debug("Creating basic subscription")
 	
+	// Use CallMethod - this handles SOAP envelope and authentication automatically
 	response, err := dev.Client.CallMethod(createSubscription)
 	if err != nil {
 		return "", err
 	}
 
-	return m.parseSubscriptionResponseXML(response)
+	return m.parseSubscriptionResponse(response)
 }
 
-// parseSubscriptionResponseXML parses the subscription response to extract the subscription endpoint URL
-func (m *Manager) parseSubscriptionResponseXML(response *http.Response) (string, error) {
+// parseSubscriptionResponse parses the subscription response to extract the subscription endpoint URL
+func (m *Manager) parseSubscriptionResponse(response *http.Response) (string, error) {
 	if response == nil {
 		return "", fmt.Errorf("response is nil")
 	}
@@ -875,17 +824,9 @@ func (m *Manager) parseSubscriptionResponseXML(response *http.Response) (string,
 	return "", fmt.Errorf("could not extract subscription address from response: %s", responseStr[:min(200, len(responseStr))])
 }
 
-// pullEvents pulls event messages from the ONVIF device using the SIMPLIFIED APPROACH from library examples
+// pullEvents pulls event messages from the ONVIF device using CallMethod - MAIN FIX
 func (m *Manager) pullEvents(dev *Device) error {
-	dev.mu.RLock()
-	subscriptionAddr := dev.SubscriptionAddr
-	dev.mu.RUnlock()
-
-	if subscriptionAddr == "" {
-		return fmt.Errorf("no subscription address available")
-	}
-
-	// Create PullMessages request using the EXACT PATTERN from library examples
+	// Create PullMessages request using standard approach
 	timeoutStr := formatDurationToXSD(m.appConfig.ONVIF.EventPullTimeout)
 	pullMessages := event.PullMessages{
 		Timeout:      xsd.Duration(timeoutStr),
@@ -893,19 +834,12 @@ func (m *Manager) pullEvents(dev *Device) error {
 	}
 
 	dev.logger.WithFields(map[string]interface{}{
-		"message_limit":     100,
-		"timeout":           timeoutStr,
-		"subscription_addr": subscriptionAddr,
+		"message_limit": 100,
+		"timeout":       timeoutStr,
 	}).Debug("Pulling events from ONVIF subscription endpoint")
 
-	// SIMPLIFIED APPROACH: Use simple XML marshaling exactly like the library examples
-	requestBody, err := xml.Marshal(pullMessages)
-	if err != nil {
-		return fmt.Errorf("failed to marshal PullMessages request: %w", err)
-	}
-
-	// Use SendSoap with simple marshaled request - exactly like library examples
-	response, err := dev.Client.SendSoap(subscriptionAddr, string(requestBody))
+	// MAIN FIX: Use CallMethod instead of SendSoap - this handles SOAP envelope and WS-Addressing headers automatically
+	response, err := dev.Client.CallMethod(pullMessages)
 	if err != nil {
 		// Check if this is a subscription-related error
 		if strings.Contains(err.Error(), "subscription") || strings.Contains(err.Error(), "reference") {
@@ -946,29 +880,15 @@ func (m *Manager) pullEvents(dev *Device) error {
 	return nil
 }
 
-// renewSubscription renews the ONVIF event subscription using SIMPLIFIED APPROACH
+// renewSubscription renews the ONVIF event subscription using CallMethod - IMPROVED
 func (m *Manager) renewSubscription(dev *Device) error {
-	dev.mu.RLock()
-	subscriptionAddr := dev.SubscriptionAddr
-	dev.mu.RUnlock()
-
-	if subscriptionAddr == "" {
-		return fmt.Errorf("no subscription address available")
-	}
-
 	durationStr := formatDurationToXSD(m.appConfig.ONVIF.SubscriptionRenew)
 	renewReq := event.Renew{
 		TerminationTime: xsd.String(durationStr),
 	}
 
-	// SIMPLIFIED APPROACH: Use simple XML marshaling exactly like library examples
-	requestBody, err := xml.Marshal(renewReq)
-	if err != nil {
-		return fmt.Errorf("failed to marshal Renew request: %w", err)
-	}
-
-	// Use SendSoap with simple marshaled request
-	response, err := dev.Client.SendSoap(subscriptionAddr, string(requestBody))
+	// IMPROVED: Use CallMethod instead of SendSoap - this handles SOAP envelope and authentication automatically
+	response, err := dev.Client.CallMethod(renewReq)
 	if err != nil {
 		return fmt.Errorf("renew request failed: %w", err)
 	}
@@ -978,10 +898,12 @@ func (m *Manager) renewSubscription(dev *Device) error {
 		return fmt.Errorf("renew returned HTTP %d: %s", response.StatusCode, string(bodyBytes))
 	}
 
+	// Consume the response body
+	m.readResponseBody(response.Body)
 	return nil
 }
 
-// unsubscribeFromEvents unsubscribes from ONVIF events using SIMPLIFIED APPROACH
+// unsubscribeFromEvents unsubscribes from ONVIF events using CallMethod - IMPROVED
 func (m *Manager) unsubscribeFromEvents(dev *Device) {
 	if dev.SubscriptionAddr == "" {
 		return
@@ -989,15 +911,8 @@ func (m *Manager) unsubscribeFromEvents(dev *Device) {
 
 	unsubscribeReq := event.Unsubscribe{}
 	
-	// SIMPLIFIED APPROACH: Use simple XML marshaling exactly like library examples
-	requestBody, err := xml.Marshal(unsubscribeReq)
-	if err != nil {
-		dev.logger.WithField("error", err.Error()).Warn("Failed to marshal Unsubscribe request")
-		return
-	}
-
-	// Use SendSoap with simple marshaled request
-	response, err := dev.Client.SendSoap(dev.SubscriptionAddr, string(requestBody))
+	// IMPROVED: Use CallMethod instead of SendSoap - this handles SOAP envelope and authentication automatically
+	response, err := dev.Client.CallMethod(unsubscribeReq)
 	if err != nil {
 		dev.logger.WithField("error", err.Error()).Warn("Failed to unsubscribe from events")
 		return
